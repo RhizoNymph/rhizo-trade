@@ -159,7 +159,7 @@ X_train_const = sm.add_constant(X_train_interaction.to_numpy())
 X_test_const = sm.add_constant(X_test_interaction.to_numpy())
 
 # Fit the GLSAR model
-rho = 4  # Starting with AR(2) based on previous Ljung-Box results. Change as needed.
+rho = 5  # Starting with AR(2) based on previous Ljung-Box results. Change as needed.
 model = sm.GLSAR(y_train.to_numpy(), X_train_const, rho=rho)
 glsar_model = model.iterative_fit(maxiter=5)
 
@@ -260,10 +260,11 @@ print(f"Theil's U: {theils_u_val}")
 
 # Example: Add lagged values of an existing feature (e.g., return_1d)
 
-# Add lagged values (e.g., 1, 2, and 3 lags) of 'return_1d' to both training and testing sets
+lagged_features = ["return_1d"]
 for i in range(1, 4):
-  X_train = X_train.with_columns(pl.col("return_1d").shift(i).alias(f"return_1d_lag_{i}"))
-  X_test = X_test.with_columns(pl.col("return_1d").shift(i).alias(f"return_1d_lag_{i}"))
+    for feature in lagged_features:
+        X_train = X_train.with_columns(pl.col(feature).shift(i).alias(f"{feature}_lag_{i}"))
+        X_test = X_test.with_columns(pl.col(feature).shift(i).alias(f"{feature}_lag_{i}"))
 
 # Remove rows with NaNs that were introduced due to lagging
 X_train = X_train.drop_nulls()
