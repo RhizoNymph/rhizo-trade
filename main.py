@@ -1,7 +1,7 @@
 import argparse
 from index.velo.client import handle_velo_spot, handle_velo_futures, handle_velo_options
 from index.geckoterminal.client import handle_geckoterminal
-from visualize.regression import run_regression_dashboard
+
 
 def add_common_velo_args(parser):
     """Add arguments that are common to all Velo commands"""
