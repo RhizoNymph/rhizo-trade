@@ -73,13 +73,6 @@ X_scaled = X_scaled.with_columns(X_selected.select("timestamp"))
 # Concatenate the scaled features and the target variable
 data = pl.concat([X_scaled, y], how='horizontal')
 
-# Convert the combined DataFrame to a NumPy array
-data_np = data.to_numpy()
-
-# Separate the features (including 'timestamp') and the target variable
-X_np = data_np[:, :-1]  # All columns except the last one
-y_np = data_np[:, -1]   # The last column
-
 # --- Set up XGBoost parameters and hyperparameter grid ---
 
 model_params = {
@@ -92,12 +85,12 @@ model_params = {
 }
 
 hyperparameter_grid = {
-    'n_estimators': [100],
-    'max_depth': [6],
+    'n_estimators': [50, 100],
+    'max_depth': [3, 6],
     'learning_rate': [0.01, 0.1],
-    'gamma': [0.1],
-    'subsample': [0.9],
-    'colsample_bytree': [1.0],
+    'gamma': [0, 0.1],
+    'subsample': [0.8, 0.9],
+    'colsample_bytree': [0.8, 0.9, 1.0],
 }
 
 # --- Parallelized Walk-forward cross-validation for XGBoost ---
@@ -107,17 +100,21 @@ def train_and_evaluate(args):
     Function to train and evaluate XGBoost for a single hyperparameter combination and fold.
     Designed to be called in parallel.
     """
-    hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, start_val, end_val, model_params, start_time_fold = args
+    hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, unique_dates, start_val_date_idx, end_val_date_idx, model_params, start_time_fold = args
     fold_train_rmses = []
     fold_val_rmses = []
 
     # Progressively add validation points to the training set
     X_train_fold = X_train_fold_cpu.clone().detach().to('cuda')
     y_train_fold = y_train_fold_cpu.clone().detach().to('cuda')
-    for j in range(len(X_train_val[start_val:end_val])):
-        # Move the validation point to the GPU before concatenation
-        X_val_point = X_train_val[start_val + j:start_val + j + 1].to('cuda')  # <--- FIX HERE
-        y_val_point = y_train_val[start_val + j:start_val + j + 1].to('cuda')
+
+    for date_idx in range(start_val_date_idx, end_val_date_idx):
+        current_date = unique_dates[date_idx]
+
+        # Select data for the current date
+        date_mask = X_train_val[:, -1] == current_date  # Assuming 'timestamp' is the last column
+        X_val_point = X_train_val[date_mask].to('cuda')
+        y_val_point = y_train_val[date_mask].to('cuda')
 
         # 1. Data scaling (fit on training, transform both)
         scaler_X = StandardScaler()
@@ -155,10 +152,10 @@ def train_and_evaluate(args):
 
         # 5. Evaluate
         train_rmse = np.sqrt(mean_squared_error(y_train_fold_rescaled.cpu(), y_train_pred.cpu()))
-        val_rmse = np.sqrt(mean_squared_error(y_val_point.cpu(), y_val_pred.cpu())) # Use y_val_point here
+        val_rmse = np.sqrt(mean_squared_error(y_val_point.cpu(), y_val_pred.cpu()))
 
         # Add the current validation point to the training set
-        X_train_fold = torch.cat([X_train_fold, X_val_point])  # Now both tensors are on the GPU
+        X_train_fold = torch.cat([X_train_fold, X_val_point])
         y_train_fold = torch.cat([y_train_fold, y_val_point])
 
         fold_train_rmses.append(train_rmse)
@@ -169,8 +166,8 @@ def train_and_evaluate(args):
     avg_fold_val_rmse = np.mean(fold_val_rmses)
 
     return avg_fold_train_rmse, avg_fold_val_rmse, hyperparams, fold_idx, time.time() - start_time_fold
-    
-def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, n_splits, test_size):
+
+def time_series_walk_forward_cv_xgboost_parallel(data, model_params, hyperparameter_grid, n_splits, test_size):
     """
     Performs walk-forward cross-validation for time series data with hyperparameter tuning,
     progressively adding validation points one at a time during evaluation.
@@ -178,10 +175,15 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     Specialized for XGBoost and parallelized using multiprocessing.
     """
 
-    # Split data into training/validation and test sets
-    X_train_val, X_test, y_train_val, y_test = train_test_split(
-        features, target, test_size=test_size, shuffle=False
-    )
+    # Split data into training/validation and test sets based on time
+    data_sorted = data.sort_values(by=['timestamp'])
+    n = len(data_sorted)
+    train_val_end_idx = int(n * (1 - test_size))
+
+    X_train_val = data_sorted.iloc[:train_val_end_idx, :-1].values  # All columns except the last one are features
+    y_train_val = data_sorted.iloc[:train_val_end_idx, -1].values   # The last column is the target
+    X_test = data_sorted.iloc[train_val_end_idx:, :-1].values
+    y_test = data_sorted.iloc[train_val_end_idx:, -1].values
 
     # Convert data to NumPy arrays and then to PyTorch tensors on CPU
     X_train_val = torch.tensor(X_train_val, dtype=torch.float32, device='cpu')
@@ -189,9 +191,12 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     X_test = torch.tensor(X_test, dtype=torch.float32, device='cpu')
     y_test = torch.tensor(y_test, dtype=torch.float32, device='cpu').view(-1, 1)
 
+    # Get unique dates in the training/validation set
+    unique_dates = np.unique(X_train_val[:, -1].cpu().numpy()) # Assuming 'timestamp' is the last column
+
     # Prepare for walk-forward validation
-    n_train_val = len(X_train_val)
-    fold_size = n_train_val // n_splits
+    n_train_val_dates = len(unique_dates)
+    fold_size = n_train_val_dates // n_splits
 
     # Ensure at least one sample in the initial training set
     if fold_size == 0:
@@ -210,16 +215,20 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     # Prepare arguments for parallel processing
     args_list = []
     for fold_idx in range(n_splits):
-        start_train = 0
-        end_train = max(1, fold_idx * fold_size)
-        start_val = end_train
-        end_val = start_val + fold_size
-        X_train_fold_cpu = X_train_val[start_train:end_train].clone().detach()
-        y_train_fold_cpu = y_train_val[start_train:end_train].clone().detach()
+        start_train_date_idx = 0
+        end_train_date_idx = max(1, fold_idx * fold_size)
+        start_val_date_idx = end_train_date_idx
+        end_val_date_idx = start_val_date_idx + fold_size
+
+        # Get the training data based on the date indices
+        train_dates = unique_dates[start_train_date_idx:end_train_date_idx]
+        train_date_mask = np.isin(X_train_val[:, -1].cpu().numpy(), train_dates)
+        X_train_fold_cpu = X_train_val[train_date_mask].clone().detach()
+        y_train_fold_cpu = y_train_val[train_date_mask].clone().detach()
 
         for hyperparam_idx, hyperparams in enumerate(hyperparameter_combinations):
             start_time_fold = time.time()
-            args_list.append((hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, start_val, end_val, model_params, start_time_fold))
+            args_list.append((hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, unique_dates, start_val_date_idx, end_val_date_idx, model_params, start_time_fold))
 
 
     # Parallel processing using multiprocessing Pool INSIDE if __name__ == '__main__':
@@ -276,13 +285,10 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         print(f"  Best Hyperparameters: {best_model_params}")
         print(f"  Best Average Validation RMSE: {best_avg_val_rmse:.4f}")
 
-        # return avg_train_rmse, avg_val_rmse, test_rmse, best_model_params, best_avg_val_rmse # unnecessary return statement
-
 # --- Perform walk-forward cross-validation for XGBoost ---
 
 time_series_walk_forward_cv_xgboost_parallel(
-    features=X_np,
-    target=y_np,
+    data=data,
     model_params=model_params,
     hyperparameter_grid=hyperparameter_grid,
     n_splits=5,
