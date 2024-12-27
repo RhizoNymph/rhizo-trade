@@ -80,106 +80,109 @@ hyperparameter_grid = {
 }
 
 def train_and_evaluate(args):
-    hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, start_val, end_val, model_params, start_time_fold = args
-    fold_train_rmses = []
-    fold_val_rmses = []
-    predictions = []
-    timestamps = []
-
+    hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_val_fold_cpu, y_val_fold_cpu, model_params, start_time_fold = args
+    
     logging.info(f"Starting fold {fold_idx+1} evaluation with hyperparams: {hyperparams}")
     
-    X_train_fold = X_train_fold_cpu.clone().detach().to('cuda')
-    y_train_fold = y_train_fold_cpu.clone().detach().to('cuda')
+    # Clear GPU cache at the start of processing
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    total_points = len(X_train_val[start_val:end_val])
-    logging.info(f"Processing {total_points} validation points for fold {fold_idx+1}")
+    # Process in batches to manage memory
+    batch_size = 1024  # Adjust this based on your GPU memory
     
-    # Walk forward one day at a time
-    for j in range(total_points):
-        if j % 1000 == 0:  # Log progress every 10 points
-            logging.info(f"Fold {fold_idx+1}: Processing point {j+1}/{total_points}")
-            
-        current_timestamp = X_train_val[start_val + j, -1].item()
-        X_val_point = X_train_val[start_val + j:start_val + j + 1].to('cuda')
-        y_val_point = y_train_val[start_val + j:start_val + j + 1].to('cuda')
-
-        scaler_X = StandardScaler()
-        X_train_scaled = scaler_X.fit_transform(X_train_fold.cpu())
-        X_val_scaled = scaler_X.transform(X_val_point.cpu())
-
-        scaler_y = StandardScaler()
-        y_train_scaled = scaler_y.fit_transform(y_train_fold.cpu())
-
-        X_train_scaled = torch.tensor(X_train_scaled, dtype=torch.float32, device='cuda')
-        X_val_scaled = torch.tensor(X_val_scaled, dtype=torch.float32, device='cuda')
-        y_train_scaled = torch.tensor(y_train_scaled, dtype=torch.float32, device='cuda')
-
-        current_model_params = model_params.copy()
-        current_model_params.update(hyperparams)
-
-        model = xgb.XGBRegressor(**current_model_params)
-        model.fit(X_train_scaled, y_train_scaled.ravel())
-
-        y_train_pred = model.predict(X_train_scaled)
-        y_val_pred = model.predict(X_val_scaled)
-
-        y_train_pred = scaler_y.inverse_transform(y_train_pred.reshape(-1, 1)).flatten()
-        y_val_pred = scaler_y.inverse_transform(y_val_pred.reshape(-1, 1)).flatten()
-        y_train_fold_rescaled = scaler_y.inverse_transform(y_train_scaled.cpu()).flatten()
-
-        y_train_pred = torch.tensor(y_train_pred, dtype=torch.float32, device='cuda')
-        y_val_pred = torch.tensor(y_val_pred, dtype=torch.float32, device='cuda')
-        y_train_fold_rescaled = torch.tensor(y_train_fold_rescaled, dtype=torch.float32, device='cuda')
-
-        train_rmse = np.sqrt(mean_squared_error(y_train_fold_rescaled.cpu(), y_train_pred.cpu()))
-        val_rmse = np.sqrt(mean_squared_error(y_val_point.cpu(), y_val_pred.cpu()))
-
-        # Store predictions and timestamps
-        predictions.append({
-            'timestamp': current_timestamp,
-            'actual': y_val_point.cpu().item(),
-            'predicted': y_val_pred.cpu().item(),
-            'rmse': val_rmse
-        })
+    def process_in_batches(X, y, scaler=None):
+        if scaler:
+            X = scaler.transform(X.cpu().numpy())
+            X = torch.tensor(X, dtype=torch.float32)
         
-        # Update training data for next iteration
-        X_train_fold = torch.cat([X_train_fold, X_val_point])
-        y_train_fold = torch.cat([y_train_fold, y_val_point])
+        results = []
+        for i in range(0, len(X), batch_size):
+            batch_X = X[i:i + batch_size].cuda()
+            batch_y = y[i:i + batch_size].cuda() if y is not None else None
+            results.append((batch_X, batch_y))
+            # Move back to CPU to free GPU memory
+            if i + batch_size < len(X):
+                torch.cuda.empty_cache()
+        return results
 
-        fold_train_rmses.append(train_rmse)
-        fold_val_rmses.append(val_rmse)
+    # Scale the data
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    # Fit scalers on CPU
+    X_train_np = X_train_fold_cpu.numpy()
+    y_train_np = y_train_fold_cpu.numpy().reshape(-1, 1)
+    
+    scaler_X.fit(X_train_np)
+    scaler_y.fit(y_train_np)
+    
+    # Process validation data
+    X_val_batches = process_in_batches(X_val_fold_cpu, None, scaler_X)
+    
+    # Train model with early stopping
+    current_model_params = model_params.copy()
+    current_model_params.update(hyperparams)
+    current_model_params['early_stopping_rounds'] = 5
+    
+    model = xgb.XGBRegressor(**current_model_params)
+    
+    # Train on CPU since XGBoost handles its own GPU memory
+    X_train_scaled = scaler_X.transform(X_train_np)
+    y_train_scaled = scaler_y.transform(y_train_np)
+    
+    model.fit(
+        X_train_scaled,
+        y_train_scaled.ravel(),
+        eval_set=[(X_train_scaled, y_train_scaled.ravel())],
+        verbose=False
+    )
+    
+    # Make predictions in batches
+    all_preds = []
+    for X_val_batch, _ in X_val_batches:
+        batch_pred = model.predict(X_val_batch.cpu().numpy())
+        batch_pred = scaler_y.inverse_transform(batch_pred.reshape(-1, 1)).flatten()
+        all_preds.append(torch.tensor(batch_pred, dtype=torch.float32).cuda())
+        
+    y_val_pred = torch.cat(all_preds)
+    
+    # Calculate RMSE
+    val_rmse = np.sqrt(mean_squared_error(y_val_fold_cpu.cpu(), y_val_pred.cpu()))
+    
+    # Store predictions
+    predictions = [{
+        'timestamp': X_val_fold_cpu[i, -1].cpu().item(),
+        'actual': y_val_fold_cpu[i].cpu().item(),
+        'predicted': y_val_pred[i].cpu().item(),
+        'rmse': val_rmse
+    } for i in range(len(y_val_fold_cpu))]
 
-    avg_fold_train_rmse = np.mean(fold_train_rmses)
-    avg_fold_val_rmse = np.mean(fold_val_rmses)
+    return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
-    return avg_fold_train_rmse, avg_fold_val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
-
-def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, n_splits, test_size):
+def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, validation_days=30, min_training_days=90, test_size=0.1):
     logging.info("Starting time series walk-forward cross-validation")
     logging.info(f"Data shape: Features {features.shape}, Target {target.shape}")
     
-    X_train_val, X_test, y_train_val, y_test = train_test_split(
-        features, target, test_size=test_size, shuffle=False
-    )
+    # Split into train-val and final test
+    total_days = len(features)
+    test_days = int(total_days * test_size)
+    X_train_val = features[:-test_days]
+    y_train_val = target[:-test_days]
+    X_test = features[-test_days:]
+    y_test = target[-test_days:]
     
-    logging.info(f"Train-val set size: {len(X_train_val)}, Test set size: {len(X_test)}")
-
-    X_train_val = torch.tensor(X_train_val, dtype=torch.float32, device='cpu')
-    y_train_val = torch.tensor(y_train_val, dtype=torch.float32, device='cpu').view(-1, 1)
-    X_test = torch.tensor(X_test, dtype=torch.float32, device='cpu')
-    y_test = torch.tensor(y_test, dtype=torch.float32, device='cpu').view(-1, 1)
- 
-    n_train_val = len(X_train_val)
-    fold_size = n_train_val // n_splits
+    logging.info(f"Train-val size: {len(X_train_val)}, Test size: {len(X_test)}")
     
-    logging.info(f"Number of folds: {n_splits}, Fold size: {fold_size}")
+    # Calculate number of validation windows
+    total_train_val_days = len(X_train_val)
+    n_splits = (total_train_val_days - min_training_days) // validation_days
     
-    if fold_size == 0:
-        raise ValueError("Fold size cannot be zero. Increase n_train_val or decrease n_splits.")
-  
-    train_rmses = []
+    logging.info(f"Using {n_splits} validation windows of {validation_days} days each")
+    logging.info(f"Minimum training size: {min_training_days} days")
+    
     val_rmses = []
-    best_avg_val_rmse = float('inf')
+    best_val_rmse = float('inf')
     best_model_params = None
     all_predictions = []
     
@@ -189,16 +192,24 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     
     args_list = []
     for fold_idx in range(n_splits):
-        start_train = 0
-        end_train = max(1, fold_idx * fold_size)
-        start_val = end_train
-        end_val = start_val + fold_size
-        X_train_fold_cpu = X_train_val[start_train:end_train].clone().detach()
-        y_train_fold_cpu = y_train_val[start_train:end_train].clone().detach()
+        # Calculate window boundaries
+        end_val = total_train_val_days - (n_splits - fold_idx - 1) * validation_days
+        start_val = end_val - validation_days
+        start_train = 0  # Always start from beginning
+        end_train = start_val
+        
+        if end_train - start_train < min_training_days:
+            continue
+            
+        X_train_fold = torch.tensor(X_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
+        y_train_fold = torch.tensor(y_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
+        X_val_fold = torch.tensor(X_train_val[start_val:end_val], dtype=torch.float32, device='cpu')
+        y_val_fold = torch.tensor(y_train_val[start_val:end_val], dtype=torch.float32, device='cpu')
 
-        for hyperparam_idx, hyperparams in enumerate(hyperparameter_combinations):
+        for hyperparams in hyperparameter_combinations:
             start_time_fold = time.time()
-            args_list.append((hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_train_val, y_train_val, start_val, end_val, model_params, start_time_fold))
+            args_list.append((hyperparams, fold_idx, X_train_fold, y_train_fold, 
+                            X_val_fold, y_val_fold, model_params, start_time_fold))
     
     if __name__ == '__main__':
         multiprocessing.set_start_method('spawn')
@@ -208,18 +219,17 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
             results = pool.map(train_and_evaluate, args_list)
 
         logging.info("Processing results from all folds")
-        for avg_fold_train_rmse, avg_fold_val_rmse, hyperparams, fold_idx, duration, predictions in results:
-            train_rmses.append(avg_fold_train_rmse)
-            val_rmses.append(avg_fold_val_rmse)
+        for val_rmse, hyperparams, fold_idx, duration, predictions in results:
+            val_rmses.append(val_rmse)
             all_predictions.extend(predictions)
 
-            if avg_fold_val_rmse < best_avg_val_rmse:
-                best_avg_val_rmse = avg_fold_val_rmse
+            if val_rmse < best_val_rmse:
+                best_val_rmse = val_rmse
                 best_model_params = hyperparams
-                logging.info(f"New best model found! RMSE: {best_avg_val_rmse:.4f}")
+                logging.info(f"New best model found! RMSE: {best_val_rmse:.4f}")
                 logging.info(f"Best hyperparameters: {best_model_params}")
 
-            print(f"Fold {fold_idx+1}, Hyperparams: {hyperparams}, Avg Train RMSE: {avg_fold_train_rmse:.4f}, Avg Val RMSE: {avg_fold_val_rmse:.4f}, Time: {duration:.2f}s")
+            print(f"Fold {fold_idx+1}, Hyperparams: {hyperparams}, Val RMSE: {val_rmse:.4f}, Time: {duration:.2f}s")
 
         # Create predictions DataFrame and sort by timestamp
         predictions_df = pl.DataFrame(all_predictions)
@@ -228,23 +238,47 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         print("\nLatest Validation Predictions:")
         print(predictions_df.tail(10))
 
+        # Train final model on all data except test set
         logging.info("Training final model with best hyperparameters")
+        X_train_val_tensor = torch.tensor(X_train_val, dtype=torch.float32, device='cuda')
+        y_train_val_tensor = torch.tensor(y_train_val, dtype=torch.float32, device='cuda')
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32, device='cuda')
+        y_test_tensor = torch.tensor(y_test, dtype=torch.float32, device='cuda')
+
+        # Scale all data
         scaler_X_final = StandardScaler()
-        X_train_val_scaled = scaler_X_final.fit_transform(X_train_val.cpu())
-        X_test_scaled = scaler_X_final.transform(X_test.cpu())
+        X_train_val_scaled = scaler_X_final.fit_transform(X_train_val_tensor.cpu())
+        X_test_scaled = scaler_X_final.transform(X_test_tensor.cpu())
 
         scaler_y_final = StandardScaler()
-        y_train_val_scaled = scaler_y_final.fit_transform(y_train_val.cpu())
+        y_train_val_scaled = scaler_y_final.fit_transform(y_train_val_tensor.cpu())
 
+        # Convert back to GPU tensors
         X_train_val_scaled = torch.tensor(X_train_val_scaled, dtype=torch.float32, device='cuda')
         X_test_scaled = torch.tensor(X_test_scaled, dtype=torch.float32, device='cuda')
         y_train_val_scaled = torch.tensor(y_train_val_scaled, dtype=torch.float32, device='cuda')
 
-        final_model = xgb.XGBRegressor(**model_params)
-        final_model.set_params(**best_model_params)
-        final_model.fit(X_train_val_scaled, y_train_val_scaled.ravel())
+        # Train final model
+        final_model_params = model_params.copy()
+        final_model_params.update(best_model_params)
+        final_model_params['early_stopping_rounds'] = 10
         
-        # Save the model and scalers
+        final_model = xgb.XGBRegressor(**final_model_params)
+        
+        # Split for early stopping in final model
+        split_idx = int(len(X_train_val_scaled) * 0.9)
+        X_train_final = X_train_val_scaled[:split_idx]
+        X_early_stop_final = X_train_val_scaled[split_idx:]
+        y_train_final = y_train_val_scaled[:split_idx]
+        y_early_stop_final = y_train_val_scaled[split_idx:]
+        
+        final_model.fit(
+            X_train_final, y_train_final.ravel(),
+            eval_set=[(X_early_stop_final, y_early_stop_final.ravel())],
+            verbose=False
+        )
+        
+        # Save the model
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_dir = "models"
         if not os.path.exists(model_dir):
@@ -258,14 +292,14 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         logging.info("Making predictions on test set")
         y_test_pred = final_model.predict(X_test_scaled)
         y_test_pred = scaler_y_final.inverse_transform(y_test_pred.reshape(-1, 1))
-        test_rmse = np.sqrt(mean_squared_error(y_test.cpu(), y_test_pred))
+        test_rmse = np.sqrt(mean_squared_error(y_test_tensor.cpu(), y_test_pred))
         
         logging.info(f"Final Test Set RMSE: {test_rmse:.4f}")
         
         # Create test set predictions DataFrame
         test_predictions = {
-            'timestamp': X_test[:, -1].cpu().numpy(),
-            'actual': y_test.cpu().numpy().flatten(),
+            'timestamp': X_test_tensor[:, -1].cpu().numpy(),
+            'actual': y_test_tensor.cpu().numpy().flatten(),
             'predicted': y_test_pred.flatten(),
             'rmse': [test_rmse] * len(y_test)
         }
@@ -288,6 +322,7 @@ time_series_walk_forward_cv_xgboost_parallel(
     target=y_np,
     model_params=model_params,
     hyperparameter_grid=hyperparameter_grid,
-    n_splits=5,
-    test_size=0.2
+    validation_days=30,
+    min_training_days=90,
+    test_size=0.1
 )
