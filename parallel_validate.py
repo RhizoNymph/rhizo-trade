@@ -133,8 +133,17 @@ def train_and_evaluate(args):
 
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
-def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7):
-    """Perform time series walk-forward cross-validation with XGBoost."""
+def time_series_walk_forward_cv_xgboost_parallel(
+    features, target, model_params, hyperparameter_grid, mode, n_folds=5, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7
+):
+    """Perform time series walk-forward cross-validation with XGBoost.
+    
+    Parameters:
+        mode (str): 'dynamic' for dynamic folds based on dataset size, 'fixed' for a fixed number of folds.
+        n_folds (int): Number of folds to use in 'fixed' mode.
+        validation_days (int): Number of days in each validation window (used in 'dynamic' mode).
+        min_training_days (int): Minimum number of training days required (used in 'dynamic' mode).
+    """
     logging.info("Starting time series walk-forward cross-validation")
     logging.info(f"Data shape: Features {features.shape}, Target {target.shape}")
     
@@ -148,13 +157,20 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     
     logging.info(f"Train-val size: {len(X_train_val)}, Test size: {len(X_test)}")
     
-    # Calculate number of validation windows
-    total_train_val_days = len(X_train_val)
-    n_splits = (total_train_val_days - min_training_days - gap_days) // validation_days
-    
-    logging.info(f"Using {n_splits} validation windows of {validation_days} days each")
-    logging.info(f"Minimum training size: {min_training_days} days")
-    logging.info(f"Gap between train and validation sets: {gap_days} days")
+    if mode == 'dynamic':
+        # Calculate number of validation windows dynamically
+        total_train_val_days = len(X_train_val)
+        n_splits = (total_train_val_days - min_training_days - gap_days) // validation_days
+        logging.info(f"Using dynamic mode with {n_splits} validation windows of {validation_days} days each")
+        logging.info(f"Minimum training size: {min_training_days} days")
+        logging.info(f"Gap between train and validation sets: {gap_days} days")
+    elif mode == 'fixed':
+        # Use a fixed number of folds
+        n_splits = n_folds
+        val_window_size = len(X_train_val) // n_splits
+        logging.info(f"Using fixed mode with {n_splits} folds")
+    else:
+        raise ValueError("Invalid mode. Choose 'dynamic' or 'fixed'.")
     
     val_rmses = []
     best_val_rmse = float('inf')
@@ -167,15 +183,26 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     
     args_list = []
     for fold_idx in range(n_splits):
-        # Calculate window boundaries
-        end_val = total_train_val_days - (n_splits - fold_idx - 1) * validation_days
-        start_val = end_val - validation_days
-        start_train = 0  # Always start from beginning
-        end_train = start_val - gap_days
-        
-        if end_train - start_train < min_training_days:
-            continue
+        if mode == 'dynamic':
+            # Calculate window boundaries for dynamic mode
+            end_val = total_train_val_days - (n_splits - fold_idx - 1) * validation_days
+            start_val = end_val - validation_days
+            start_train = 0  # Always start from beginning
+            end_train = start_val - gap_days
             
+            if end_train - start_train < min_training_days:
+                continue  # Skip if training set is too small
+        elif mode == 'fixed':
+            # Calculate window boundaries for fixed mode
+            val_window_size = len(X_train_val) // n_splits
+            start_val = fold_idx * val_window_size
+            end_val = (fold_idx + 1) * val_window_size if fold_idx < n_splits - 1 else len(X_train_val)
+            start_train = 0
+            end_train = start_val - gap_days
+            
+            if end_train - start_train < 1:
+                continue  # Skip if training set is too small
+        
         X_train_fold = torch.tensor(X_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
         y_train_fold = torch.tensor(y_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
         X_val_fold = torch.tensor(X_train_val[start_val:end_val], dtype=torch.float32, device='cpu')
@@ -223,13 +250,15 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         # Scale all data
         scaler_X_final = StandardScaler()
         X_train_val_scaled = scaler_X_final.fit_transform(X_train_val_tensor.cpu())
-        X_test_scaled = scaler_X_final.transform(X_test_tensor.cpu())
 
+        # Reshape y_train_val_tensor to 2D array
+        y_train_val_np = y_train_val_tensor.cpu().numpy().reshape(-1, 1)
         scaler_y_final = StandardScaler()
-        y_train_val_scaled = scaler_y_final.fit_transform(y_train_val_tensor.cpu())
+        y_train_val_scaled = scaler_y_final.fit_transform(y_train_val_np)
 
         # Convert back to GPU tensors
         X_train_val_scaled = torch.tensor(X_train_val_scaled, dtype=torch.float32, device='cuda')
+        X_test_scaled = scaler_X_final.transform(X_test_tensor.cpu())
         X_test_scaled = torch.tensor(X_test_scaled, dtype=torch.float32, device='cuda')
         y_train_val_scaled = torch.tensor(y_train_val_scaled, dtype=torch.float32, device='cuda')
 
@@ -267,23 +296,25 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         logging.info("Making predictions on test set")
         y_test_pred = final_model.predict(X_test_scaled)
         y_test_pred = scaler_y_final.inverse_transform(y_test_pred.reshape(-1, 1))
-        test_rmse = np.sqrt(mean_squared_error(y_test_tensor.cpu(), y_test_pred))
-        
+        test_rmse = np.sqrt(mean_squared_error(y_test_tensor.cpu().numpy(), y_test_pred))
+
         logging.info(f"Final Test Set RMSE: {test_rmse:.4f}")
-        
+
         # Create test set predictions DataFrame
         test_predictions = {
-            'timestamp': X_test_tensor[:, -1],
-            'actual': y_test_tensor.flatten(),
-            'predicted': y_test_pred.flatten(),
-            'rmse': [test_rmse] * len(y_test)
+            'timestamp': X_test_tensor[:, -1].cpu().numpy(),  # Convert to NumPy array
+            'actual': y_test_tensor.cpu().numpy().flatten(),  # Convert to NumPy array
+            'predicted': y_test_pred.flatten(),               # y_test_pred is already a NumPy array
+            'rmse': [test_rmse] * len(y_test)                # List of RMSE values
         }
+
+        # Create Polars DataFrame
         test_predictions_df = pl.DataFrame(test_predictions)
         test_predictions_df = test_predictions_df.sort("timestamp")
-        
+
         print("\nLatest Test Set Predictions:")
         print(test_predictions_df.tail(10))
-        
+
         # Save predictions
         predictions_path = os.path.join(model_dir, f"predictions_{timestamp}.csv")
         test_predictions_df.write_csv(predictions_path)
@@ -323,8 +354,8 @@ if __name__ == '__main__':
         target=y_np,
         model_params=model_params,
         hyperparameter_grid=hyperparameter_grid,
-        validation_days=30,
-        min_training_days=90,
+        mode='fixed',  
+        n_folds=5,     
         test_size=0.1,
-        gap_days=7
+        gap_days=14
     )
