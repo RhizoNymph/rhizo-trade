@@ -1,19 +1,16 @@
-import glob
-import polars as pl
-import numpy as np
-import matplotlib.pyplot as plt
-import xgboost as xgb
-import torch
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.metrics import mean_squared_error
-import statsmodels.api as sm
-import multiprocessing
-from itertools import product
-import time
 import logging
+import multiprocessing
 import os
+import time
 from datetime import datetime
+from itertools import product
+
+import numpy as np
+import polars as pl
+import torch
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 
 # Set up logging
 logging.basicConfig(
@@ -22,78 +19,56 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-from preprocessing import *
-from data import load_data
+def load_and_preprocess_data():
+    """Load and preprocess the data."""
+    from preprocessing import select_features_vif_polars
+    from data import load_data
 
-df = load_data()
+    # Load data
+    df = load_data()
+    X = df.select(["timestamp", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
+    y = df.select("future_return_14d")
 
-X = df.select(["timestamp", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
-y = df.select("future_return_14d")
+    # Feature selection
+    selected_features = select_features_vif_polars(X.drop("timestamp"), threshold=5)
+    selected_features = ["timestamp"] + selected_features  
+    X_selected = X.select(selected_features)
 
-selected_features = select_features_vif_polars(X.drop("timestamp"), threshold=5)
-selected_features = ["timestamp"] + selected_features  
-X_selected = X.select(selected_features)
+    # Polynomial features and scaling
+    features_for_scaling = [col for col in selected_features if col != 'timestamp']
+    interaction = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
+    X_interaction = interaction.fit_transform(X_selected.select(features_for_scaling))
+    feature_names = interaction.get_feature_names_out(features_for_scaling)
 
-features_for_scaling = [col for col in selected_features if col != 'timestamp']
+    X_interaction = pl.DataFrame(X_interaction).rename(
+        {f"column_{i}": name for i, name in enumerate(feature_names)}
+    )
 
-interaction = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
-X_interaction = interaction.fit_transform(X_selected.select(features_for_scaling))
-feature_names = interaction.get_feature_names_out(features_for_scaling)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_interaction)
+    X_scaled = pl.DataFrame(X_scaled, schema=X_interaction.columns)
+    X_scaled = X_scaled.with_columns(X_selected.select("timestamp"))
 
-X_interaction = pl.DataFrame(X_interaction).rename(
-    {f"column_{i}": name for i, name in enumerate(feature_names)}
-)
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_interaction)
-
-X_scaled = pl.DataFrame(X_scaled, schema=X_interaction.columns)
-
-X_scaled = X_scaled.with_columns(X_selected.select("timestamp"))
-
-data = pl.concat([X_scaled, y], how='horizontal')
-
-data_np = data.to_numpy()
-
-X_np = data_np[:, :-1]  
-y_np = data_np[:, -1]   
-
-model_params = {
-    'objective': 'reg:squarederror',
-    'eval_metric': 'rmse',
-    'booster': 'gbtree',
-    'nthread': -1,
-    'seed': 42,
-    'device': 'cuda'
-}
-
-hyperparameter_grid = {
-    'n_estimators': [200, 300],
-    'max_depth': [5, 7],
-    'learning_rate': [0.03, 0.05],
-    'gamma': [0.1],
-    'subsample': [0.9],
-    'colsample_bytree': [0.9, 1.0],
-    'min_child_weight': [3],
-    'lambda': [1],
-    'alpha': [0]
-}
+    # Combine features and target
+    data = pl.concat([X_scaled, y], how='horizontal')
+    return data.to_numpy()
 
 def train_and_evaluate(args):
+    """Train and evaluate the model for a given fold and hyperparameters."""
     hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_val_fold_cpu, y_val_fold_cpu, model_params, start_time_fold = args
     
     logging.info(f"Starting fold {fold_idx+1} evaluation with hyperparams: {hyperparams}")
     
-    # Clear GPU cache at the start of processing
+    # Clear GPU cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Process in batches to manage memory
-    batch_size = 1024  # Adjust this based on your GPU memory
+    # Process in batches to manage GPU memory
+    batch_size = 1024  # Adjust based on GPU memory
     
     def process_in_batches(X, y, scaler=None):
         if scaler:
-            X = scaler.transform(X.cpu().numpy())
+            X = scaler.transform(X)
             X = torch.tensor(X, dtype=torch.float32)
         
         results = []
@@ -101,7 +76,6 @@ def train_and_evaluate(args):
             batch_X = X[i:i + batch_size].cuda()
             batch_y = y[i:i + batch_size].cuda() if y is not None else None
             results.append((batch_X, batch_y))
-            # Move back to CPU to free GPU memory
             if i + batch_size < len(X):
                 torch.cuda.empty_cache()
         return results
@@ -110,7 +84,6 @@ def train_and_evaluate(args):
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
-    # Fit scalers on CPU
     X_train_np = X_train_fold_cpu.numpy()
     y_train_np = y_train_fold_cpu.numpy().reshape(-1, 1)
     
@@ -141,7 +114,7 @@ def train_and_evaluate(args):
     # Make predictions in batches
     all_preds = []
     for X_val_batch, _ in X_val_batches:
-        batch_pred = model.predict(X_val_batch.cpu().numpy())
+        batch_pred = model.predict(X_val_batch)
         batch_pred = scaler_y.inverse_transform(batch_pred.reshape(-1, 1)).flatten()
         all_preds.append(torch.tensor(batch_pred, dtype=torch.float32).cuda())
         
@@ -160,7 +133,8 @@ def train_and_evaluate(args):
 
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
-def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, validation_days=30, min_training_days=90, test_size=0.1):
+def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7):
+    """Perform time series walk-forward cross-validation with XGBoost."""
     logging.info("Starting time series walk-forward cross-validation")
     logging.info(f"Data shape: Features {features.shape}, Target {target.shape}")
     
@@ -176,10 +150,11 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     
     # Calculate number of validation windows
     total_train_val_days = len(X_train_val)
-    n_splits = (total_train_val_days - min_training_days) // validation_days
+    n_splits = (total_train_val_days - min_training_days - gap_days) // validation_days
     
     logging.info(f"Using {n_splits} validation windows of {validation_days} days each")
     logging.info(f"Minimum training size: {min_training_days} days")
+    logging.info(f"Gap between train and validation sets: {gap_days} days")
     
     val_rmses = []
     best_val_rmse = float('inf')
@@ -196,7 +171,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         end_val = total_train_val_days - (n_splits - fold_idx - 1) * validation_days
         start_val = end_val - validation_days
         start_train = 0  # Always start from beginning
-        end_train = start_val
+        end_train = start_val - gap_days
         
         if end_train - start_train < min_training_days:
             continue
@@ -298,8 +273,8 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         
         # Create test set predictions DataFrame
         test_predictions = {
-            'timestamp': X_test_tensor[:, -1].cpu().numpy(),
-            'actual': y_test_tensor.cpu().numpy().flatten(),
+            'timestamp': X_test_tensor[:, -1],
+            'actual': y_test_tensor.flatten(),
             'predicted': y_test_pred.flatten(),
             'rmse': [test_rmse] * len(y_test)
         }
@@ -317,12 +292,39 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         logging.info("Validation complete!")
         return final_model, test_rmse, best_model_params, predictions_df, test_predictions_df
 
-time_series_walk_forward_cv_xgboost_parallel(
-    features=X_np,
-    target=y_np,
-    model_params=model_params,
-    hyperparameter_grid=hyperparameter_grid,
-    validation_days=30,
-    min_training_days=90,
-    test_size=0.1
-)
+if __name__ == '__main__':
+    data_np = load_and_preprocess_data()
+    X_np = data_np[:, :-1]  
+    y_np = data_np[:, -1]   
+
+    model_params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'booster': 'gbtree',
+        'nthread': -1,
+        'seed': 42,
+        'device': 'cuda'
+    }
+
+    hyperparameter_grid = {
+        'n_estimators': [200, 300],
+        'max_depth': [5, 7],
+        'learning_rate': [0.03, 0.05],
+        'gamma': [0.1],
+        'subsample': [0.9],
+        'colsample_bytree': [0.9, 1.0],
+        'min_child_weight': [3],
+        'lambda': [1],
+        'alpha': [0]
+    }
+
+    time_series_walk_forward_cv_xgboost_parallel(
+        features=X_np,
+        target=y_np,
+        model_params=model_params,
+        hyperparameter_grid=hyperparameter_grid,
+        validation_days=30,
+        min_training_days=90,
+        test_size=0.1,
+        gap_days=7
+    )
