@@ -11,6 +11,13 @@ import torch
 import xgboost as xgb
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.pipeline import Pipeline
+from sklearn.utils import shuffle
+
+from preprocessing import select_features_vif_polars
+from data import load_data
+
+pl.Config.set_tbl_rows(100)
 
 # Set up logging
 logging.basicConfig(
@@ -19,43 +26,76 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None):
+    """Preprocess the data (feature selection, polynomial features, scaling)."""
+    # Feature selection
+    if selected_features is None:
+        selected_features = select_features_vif_polars(X.drop("timestamp"), threshold=5)
+        selected_features = ["timestamp"] + selected_features  # Include timestamp in selected features
+    X_selected = X.select(selected_features)
+
+    # Separate 'timestamp' from the features to be transformed
+    features_for_transform = [col for col in selected_features if col != 'timestamp']
+    X_features = X_selected.select(features_for_transform)
+    X_timestamp = X_selected.select("timestamp")
+
+    # Convert to numpy for sklearn transformers
+    X_features_np = X_features.to_numpy()
+    X_timestamp_np = X_timestamp.to_numpy()
+
+    # Apply polynomial features
+    if poly_transform is None:
+        poly_transform = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
+        X_poly = poly_transform.fit_transform(X_features_np)
+    else:
+        X_poly = poly_transform.transform(X_features_np)
+
+    # Scale the features (excluding timestamp)
+    if scaler is None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_poly)  
+    else:
+        X_scaled = scaler.transform(X_poly)
+
+    # Combine scaled features with timestamp
+    X_scaled_df = pl.DataFrame(X_scaled)
+    timestamp_series = pl.Series("timestamp", X_timestamp_np.flatten().tolist())
+    # X_scaled_df = X_scaled_df.with_columns([timestamp_series])
+
+    # Ensure the number of rows matches
+    assert X_scaled.shape[0] == len(X_timestamp_np), "Mismatch in number of rows."
+
+    # Get feature names after polynomial transformation
+    poly_feature_names = poly_transform.get_feature_names_out(features_for_transform)
+
+    # Add 'timestamp' to the list of feature names
+    all_feature_names = list(poly_feature_names) #+ ['timestamp']
+
+    # Assign the correct column names
+    X_scaled_df.columns = all_feature_names
+
+    return X_scaled_df, scaler, poly_transform, selected_features
+
 def load_and_preprocess_data():
     """Load and preprocess the data."""
-    from preprocessing import select_features_vif_polars
-    from data import load_data
-
-    # Load data
     df = load_data()
+
+    df = df.filter(pl.col("coin") != "USDC")
+    
     X = df.select(["timestamp", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
     y = df.select("future_return_14d")
 
-    # Feature selection
-    selected_features = select_features_vif_polars(X.drop("timestamp"), threshold=5)
-    selected_features = ["timestamp"] + selected_features  
-    X_selected = X.select(selected_features)
-
-    # Polynomial features and scaling
-    features_for_scaling = [col for col in selected_features if col != 'timestamp']
-    interaction = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
-    X_interaction = interaction.fit_transform(X_selected.select(features_for_scaling))
-    feature_names = interaction.get_feature_names_out(features_for_scaling)
-
-    X_interaction = pl.DataFrame(X_interaction).rename(
-        {f"column_{i}": name for i, name in enumerate(feature_names)}
-    )
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_interaction)
-    X_scaled = pl.DataFrame(X_scaled, schema=X_interaction.columns)
-    X_scaled = X_scaled.with_columns(X_selected.select("timestamp"))
+    # Preprocess the data
+    X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
 
     # Combine features and target
-    data = pl.concat([X_scaled, y], how='horizontal')
-    return data.to_numpy()
+    data = pl.concat([pl.DataFrame(X_processed), y], how='horizontal')
+    
+    return data.to_numpy(), scaler, poly_transform, selected_features
 
 def train_and_evaluate(args):
-    """Train and evaluate the model for a given fold and hyperparameters."""
-    hyperparams, fold_idx, X_train_fold_cpu, y_train_fold_cpu, X_val_fold_cpu, y_val_fold_cpu, model_params, start_time_fold = args
+    """Train and evaluate the model for a    given fold and hyperparameters."""
+    hyperparams, fold_idx, X_train_fold, y_train_fold, X_val_fold, y_val_fold, model_params, start_time_fold, scaler = args
     
     logging.info(f"Starting fold {fold_idx+1} evaluation with hyperparams: {hyperparams}")
     
@@ -63,87 +103,40 @@ def train_and_evaluate(args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Process in batches to manage GPU memory
-    batch_size = 1024  # Adjust based on GPU memory
+    # Scale the data using the provided scaler
+    X_train_scaled = scaler.transform(X_train_fold)
+    X_val_scaled = scaler.transform(X_val_fold)
     
-    def process_in_batches(X, y, scaler=None):
-        if scaler:
-            X = scaler.transform(X)
-            X = torch.tensor(X, dtype=torch.float32)
-        
-        results = []
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:i + batch_size].cuda()
-            batch_y = y[i:i + batch_size].cuda() if y is not None else None
-            results.append((batch_X, batch_y))
-            if i + batch_size < len(X):
-                torch.cuda.empty_cache()
-        return results
-
-    # Scale the data
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    
-    X_train_np = X_train_fold_cpu.numpy()
-    y_train_np = y_train_fold_cpu.numpy().reshape(-1, 1)
-    
-    scaler_X.fit(X_train_np)
-    scaler_y.fit(y_train_np)
-    
-    # Process validation data
-    X_val_batches = process_in_batches(X_val_fold_cpu, None, scaler_X)
-    
-    # Train model with early stopping
+    # Update model parameters with hyperparameters
     current_model_params = model_params.copy()
     current_model_params.update(hyperparams)
     current_model_params['early_stopping_rounds'] = 5
     
     model = xgb.XGBRegressor(**current_model_params)
     
-    # Train on CPU since XGBoost handles its own GPU memory
-    X_train_scaled = scaler_X.transform(X_train_np)
-    y_train_scaled = scaler_y.transform(y_train_np)
-    
+    # Train the model
     model.fit(
-        X_train_scaled,
-        y_train_scaled.ravel(),
-        eval_set=[(X_train_scaled, y_train_scaled.ravel())],
+        X_train_scaled, y_train_fold,
+        eval_set=[(X_val_scaled, y_val_fold)],
         verbose=False
     )
     
-    # Make predictions in batches
-    all_preds = []
-    for X_val_batch, _ in X_val_batches:
-        batch_pred = model.predict(X_val_batch)
-        batch_pred = scaler_y.inverse_transform(batch_pred.reshape(-1, 1)).flatten()
-        all_preds.append(torch.tensor(batch_pred, dtype=torch.float32).cuda())
-        
-    y_val_pred = torch.cat(all_preds)
-    
-    # Calculate RMSE
-    val_rmse = np.sqrt(mean_squared_error(y_val_fold_cpu.cpu(), y_val_pred.cpu()))
+    # Predict on validation set
+    y_val_pred = model.predict(X_val_scaled)
+    val_rmse = np.sqrt(mean_squared_error(y_val_fold, y_val_pred))
     
     # Store predictions
     predictions = [{
-        'timestamp': X_val_fold_cpu[i, -1].cpu().item(),
-        'actual': y_val_fold_cpu[i].cpu().item(),
-        'predicted': y_val_pred[i].cpu().item(),
+        'timestamp': X_val_fold[i, -1],
+        'actual': y_val_fold[i],
+        'predicted': y_val_pred[i],
         'rmse': val_rmse
-    } for i in range(len(y_val_fold_cpu))]
-
+    } for i in range(len(y_val_fold))]
+    
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
-def time_series_walk_forward_cv_xgboost_parallel(
-    features, target, model_params, hyperparameter_grid, mode, n_folds=5, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7
-):
-    """Perform time series walk-forward cross-validation with XGBoost.
-    
-    Parameters:
-        mode (str): 'dynamic' for dynamic folds based on dataset size, 'fixed' for a fixed number of folds.
-        n_folds (int): Number of folds to use in 'fixed' mode.
-        validation_days (int): Number of days in each validation window (used in 'dynamic' mode).
-        min_training_days (int): Minimum number of training days required (used in 'dynamic' mode).
-    """
+def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, selected_features, mode='dynamic', n_folds=5, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7):
+    """Perform time series walk-forward cross-validation with XGBoost."""
     logging.info("Starting time series walk-forward cross-validation")
     logging.info(f"Data shape: Features {features.shape}, Target {target.shape}")
     
@@ -157,17 +150,15 @@ def time_series_walk_forward_cv_xgboost_parallel(
     
     logging.info(f"Train-val size: {len(X_train_val)}, Test size: {len(X_test)}")
     
+    # Calculate number of validation windows
     if mode == 'dynamic':
-        # Calculate number of validation windows dynamically
         total_train_val_days = len(X_train_val)
         n_splits = (total_train_val_days - min_training_days - gap_days) // validation_days
         logging.info(f"Using dynamic mode with {n_splits} validation windows of {validation_days} days each")
         logging.info(f"Minimum training size: {min_training_days} days")
         logging.info(f"Gap between train and validation sets: {gap_days} days")
     elif mode == 'fixed':
-        # Use a fixed number of folds
         n_splits = n_folds
-        val_window_size = len(X_train_val) // n_splits
         logging.info(f"Using fixed mode with {n_splits} folds")
     else:
         raise ValueError("Invalid mode. Choose 'dynamic' or 'fixed'.")
@@ -180,6 +171,10 @@ def time_series_walk_forward_cv_xgboost_parallel(
     keys, values = zip(*hyperparameter_grid.items())
     hyperparameter_combinations = [dict(zip(keys, v)) for v in product(*values)]
     logging.info(f"Testing {len(hyperparameter_combinations)} hyperparameter combinations")
+    
+    # Fit the scaler on the entire training data
+    scaler = StandardScaler()
+    scaler.fit(X_train_val)  # X_train_val is already a NumPy array, so no need for .cpu()
     
     args_list = []
     for fold_idx in range(n_splits):
@@ -203,15 +198,15 @@ def time_series_walk_forward_cv_xgboost_parallel(
             if end_train - start_train < 1:
                 continue  # Skip if training set is too small
         
-        X_train_fold = torch.tensor(X_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
-        y_train_fold = torch.tensor(y_train_val[start_train:end_train], dtype=torch.float32, device='cpu')
-        X_val_fold = torch.tensor(X_train_val[start_val:end_val], dtype=torch.float32, device='cpu')
-        y_val_fold = torch.tensor(y_train_val[start_val:end_val], dtype=torch.float32, device='cpu')
+        X_train_fold = X_train_val[start_train:end_train]
+        y_train_fold = y_train_val[start_train:end_train]
+        X_val_fold = X_train_val[start_val:end_val]
+        y_val_fold = y_train_val[start_val:end_val]
 
         for hyperparams in hyperparameter_combinations:
             start_time_fold = time.time()
             args_list.append((hyperparams, fold_idx, X_train_fold, y_train_fold, 
-                            X_val_fold, y_val_fold, model_params, start_time_fold))
+                            X_val_fold, y_val_fold, model_params, start_time_fold, scaler))
     
     if __name__ == '__main__':
         multiprocessing.set_start_method('spawn')
@@ -242,43 +237,31 @@ def time_series_walk_forward_cv_xgboost_parallel(
 
         # Train final model on all data except test set
         logging.info("Training final model with best hyperparameters")
-        X_train_val_tensor = torch.tensor(X_train_val, dtype=torch.float32, device='cuda')
-        y_train_val_tensor = torch.tensor(y_train_val, dtype=torch.float32, device='cuda')
-        X_test_tensor = torch.tensor(X_test, dtype=torch.float32, device='cuda')
-        y_test_tensor = torch.tensor(y_test, dtype=torch.float32, device='cuda')
-
-        # Scale all data
-        scaler_X_final = StandardScaler()
-        X_train_val_scaled = scaler_X_final.fit_transform(X_train_val_tensor.cpu())
-
-        # Reshape y_train_val_tensor to 2D array
-        y_train_val_np = y_train_val_tensor.cpu().numpy().reshape(-1, 1)
-        scaler_y_final = StandardScaler()
-        y_train_val_scaled = scaler_y_final.fit_transform(y_train_val_np)
-
-        # Convert back to GPU tensors
-        X_train_val_scaled = torch.tensor(X_train_val_scaled, dtype=torch.float32, device='cuda')
-        X_test_scaled = scaler_X_final.transform(X_test_tensor.cpu())
-        X_test_scaled = torch.tensor(X_test_scaled, dtype=torch.float32, device='cuda')
-        y_train_val_scaled = torch.tensor(y_train_val_scaled, dtype=torch.float32, device='cuda')
-
-        # Train final model
         final_model_params = model_params.copy()
         final_model_params.update(best_model_params)
         final_model_params['early_stopping_rounds'] = 10
-        
+
         final_model = xgb.XGBRegressor(**final_model_params)
-        
-        # Split for early stopping in final model
-        split_idx = int(len(X_train_val_scaled) * 0.9)
+
+        # Scale the entire training data
+        X_train_val_scaled = scaler.transform(X_train_val)
+        X_train_val_scaled = torch.tensor(X_train_val_scaled, dtype=torch.float32, device='cuda')
+
+        # Ensure y_train_val is of type float32
+        y_train_val = y_train_val.astype(np.float32)
+        y_train_val = torch.tensor(y_train_val, dtype=torch.float32, device='cuda')
+
+        # Split the training data into training and validation sets
+        split_idx = int(0.8 * len(X_train_val_scaled))  # 80% training, 20% validation
         X_train_final = X_train_val_scaled[:split_idx]
-        X_early_stop_final = X_train_val_scaled[split_idx:]
-        y_train_final = y_train_val_scaled[:split_idx]
-        y_early_stop_final = y_train_val_scaled[split_idx:]
-        
+        y_train_final = y_train_val[:split_idx]
+        X_val_final = X_train_val_scaled[split_idx:]
+        y_val_final = y_train_val[split_idx:]
+
+        # Train the final model with early stopping
         final_model.fit(
-            X_train_final, y_train_final.ravel(),
-            eval_set=[(X_early_stop_final, y_early_stop_final.ravel())],
+            X_train_final.cpu().numpy(), y_train_final.cpu().numpy(),
+            eval_set=[(X_val_final.cpu().numpy(), y_val_final.cpu().numpy())],
             verbose=False
         )
         
@@ -294,40 +277,113 @@ def time_series_walk_forward_cv_xgboost_parallel(
         
         # Make predictions on test set
         logging.info("Making predictions on test set")
-        y_test_pred = final_model.predict(X_test_scaled)
-        y_test_pred = scaler_y_final.inverse_transform(y_test_pred.reshape(-1, 1))
-        test_rmse = np.sqrt(mean_squared_error(y_test_tensor.cpu().numpy(), y_test_pred))
-
+        X_test_scaled = scaler.transform(X_test)
+        X_test_scaled = torch.tensor(X_test_scaled, dtype=torch.float32, device='cuda')
+        y_test_pred = final_model.predict(X_test_scaled.cpu().numpy())
+        y_test_pred = torch.tensor(y_test_pred, dtype=torch.float32, device='cuda')
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred.cpu().numpy()))
+        
         logging.info(f"Final Test Set RMSE: {test_rmse:.4f}")
+        
+        # # Convert columns to supported types
+        # test_predictions_df = test_predictions_df.with_columns([
+        #     pl.col("timestamp").cast(pl.Datetime),
+        #     pl.col("predicted").cast(pl.Float64)
+        # ])
 
-        # Create test set predictions DataFrame
-        test_predictions = {
-            'timestamp': X_test_tensor[:, -1].cpu().numpy(),  # Convert to NumPy array
-            'actual': y_test_tensor.cpu().numpy().flatten(),  # Convert to NumPy array
-            'predicted': y_test_pred.flatten(),               # y_test_pred is already a NumPy array
-            'rmse': [test_rmse] * len(y_test)                # List of RMSE values
-        }
-
-        # Create Polars DataFrame
-        test_predictions_df = pl.DataFrame(test_predictions)
-        test_predictions_df = test_predictions_df.sort("timestamp")
-
-        print("\nLatest Test Set Predictions:")
-        print(test_predictions_df.tail(10))
+        # current_predictions_df = current_predictions_df.with_columns([
+        #     pl.col("timestamp").cast(pl.Datetime),
+        #     pl.col("coin").cast(pl.Utf8),
+        #     pl.col("predicted_future_return_14d").cast(pl.Float64)
+        # ])
 
         # Save predictions
-        predictions_path = os.path.join(model_dir, f"predictions_{timestamp}.csv")
-        test_predictions_df.write_csv(predictions_path)
-        logging.info(f"Saved predictions to {predictions_path}")
+        # predictions_path = os.path.join(model_dir, f"predictions_{timestamp}.csv")
+        # test_predictions_df.write_csv(predictions_path)
+        # logging.info(f"Saved predictions to {predictions_path}")
+
+        # Save current predictions
+        # current_predictions_path = os.path.join(model_dir, f"current_predictions_{timestamp}.csv")
+        # current_predictions_df.write_csv(current_predictions_path)
+        # logging.info(f"Saved current predictions to {current_predictions_path}")
+        
+        # Load the current data for final predictions
+        from data import load_data
+        current_data = load_data()  # Load the current data
+        current_coins = current_data["coin"].to_numpy()  # Get the coin identifiers
+
+        # Define X_current by selecting relevant features from current_data
+        X_current = current_data.select(["timestamp", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
+
+        # Log the columns of X_current
+        logging.info(f"Selected features: {selected_features}")
+        logging.info(f"X_current columns: {X_current.columns}")
+
+        # Ensure all selected features are present in X_current
+        missing_features = [col for col in selected_features if col not in X_current.columns]
+        if missing_features:
+            logging.warning(f"Missing features in X_current: {missing_features}")
+            # Add missing features with default values (e.g., 0)
+            for feature in missing_features:
+                X_current = X_current.with_column(pl.lit(0).alias(feature))
+
+        # Filter features using selected_features
+        X_current_selected = X_current.select(selected_features)
+
+        # Exclude 'timestamp' from transformations
+        features_for_transform = [col for col in selected_features if col != 'timestamp']
+        X_current_features = X_current_selected.select(features_for_transform).to_numpy()
+
+        # Apply polynomial features using the same poly_transform object
+        X_current_poly = poly_transform.transform(X_current_features)
+
+        # Scale the features using the same scaler object
+        X_current_scaled = scaler.transform(X_current_poly)
+
+        # Combine scaled features with timestamp
+        X_current_timestamp = X_current_selected.select("timestamp").to_numpy()
+        X_current_processed = np.hstack([X_current_scaled, X_current_timestamp])
+
+        # Make predictions on the current data (drop 'timestamp' before prediction)
+        X_current_final = X_current_processed[:, :-1]  # Exclude 'timestamp'
+        y_current_pred = final_model.predict(X_current_final)
+
+        # Create current predictions DataFrame
+        current_predictions = {
+            'timestamp': X_current_timestamp.flatten(),
+            'coin': current_coins,  # Include coin identifiers
+            'predicted_future_return_14d': y_current_pred  # Predicted values
+        }
+
+        # Convert to Polars DataFrame
+        current_predictions_df = pl.DataFrame(current_predictions)
+
+        # Get only most current predictions of most recent timestamp
+        current_predictions_df = current_predictions_df.filter(pl.col("timestamp") == current_predictions_df["timestamp"].max())
+
+        # Sort by predicted_future_return_14d (descending order)
+        current_predictions_df = current_predictions_df.sort("predicted_future_return_14d", descending=True)
+
+        print("\nCurrent Predictions Sorted by Predicted (Descending):")
+        print(current_predictions_df.head(20))
+
+        # Save predictions
+        # predictions_path = os.path.join(model_dir, f"current_predictions_{timestamp}.csv")
+        # current_predictions_df.write_csv(predictions_path)
+        # logging.info(f"Saved current predictions to {predictions_path}")
         
         logging.info("Validation complete!")
-        return final_model, test_rmse, best_model_params, predictions_df, test_predictions_df
-
+        return final_model, test_rmse, best_model_params, predictions_df, current_predictions_df
+        
 if __name__ == '__main__':
-    data_np = load_and_preprocess_data()
-    X_np = data_np[:, :-1]  
-    y_np = data_np[:, -1]   
+    # Load and preprocess the data
+    data_np, scaler, poly_transform, selected_features = load_and_preprocess_data()
 
+    # Split into features (X) and target (y)
+    X_np = data_np[:, :-1]  # All columns except the last one
+    y_np = data_np[:, -1]   # The last column is the target
+
+    # Define model parameters and hyperparameter grid
     model_params = {
         'objective': 'reg:squarederror',
         'eval_metric': 'rmse',
@@ -349,13 +405,17 @@ if __name__ == '__main__':
         'alpha': [0]
     }
 
-    time_series_walk_forward_cv_xgboost_parallel(
+    # Run the cross-validation
+    final_model, test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(
         features=X_np,
         target=y_np,
         model_params=model_params,
         hyperparameter_grid=hyperparameter_grid,
-        mode='fixed',  
-        n_folds=5,     
-        test_size=0.1,
-        gap_days=14
+        selected_features=selected_features,  # Pass selected_features here
+        mode='fixed',  # Use 'dynamic' or 'fixed' mode
+        n_folds=5,     # Number of folds (for 'fixed' mode)
+        validation_days=30,  # Validation window size (for 'dynamic' mode)
+        min_training_days=90,  # Minimum training days (for 'dynamic' mode)
+        test_size=0.1,  # Proportion of data to use as test set
+        gap_days=7      # Gap between training and validation sets
     )
