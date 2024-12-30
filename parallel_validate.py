@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 import torch
 import xgboost as xgb
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
@@ -18,6 +18,7 @@ from preprocessing import select_features_vif_polars
 from data import load_data
 
 pl.Config.set_tbl_rows(100)
+pl.Config(tbl_cols=10)
 
 # Set up logging
 logging.basicConfig(
@@ -26,8 +27,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None):
-    """Preprocess the data (feature selection, polynomial features, scaling)."""
+def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None, for_training=True):
     # Feature selection
     if selected_features is None:
         selected_features = select_features_vif_polars(X.drop("timestamp"), threshold=5)
@@ -60,7 +60,6 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None)
     # Combine scaled features with timestamp
     X_scaled_df = pl.DataFrame(X_scaled)
     timestamp_series = pl.Series("timestamp", X_timestamp_np.flatten().tolist())
-    # X_scaled_df = X_scaled_df.with_columns([timestamp_series])
 
     # Ensure the number of rows matches
     assert X_scaled.shape[0] == len(X_timestamp_np), "Mismatch in number of rows."
@@ -69,7 +68,7 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None)
     poly_feature_names = poly_transform.get_feature_names_out(features_for_transform)
 
     # Add 'timestamp' to the list of feature names
-    all_feature_names = list(poly_feature_names) #+ ['timestamp']
+    all_feature_names = list(poly_feature_names)
 
     # Assign the correct column names
     X_scaled_df.columns = all_feature_names
@@ -282,8 +281,10 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         y_test_pred = final_model.predict(X_test_scaled.cpu().numpy())
         y_test_pred = torch.tensor(y_test_pred, dtype=torch.float32, device='cuda')
         test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred.cpu().numpy()))
+        test_r2 = r2_score(y_test, y_test_pred.cpu().numpy())
         
         logging.info(f"Final Test Set RMSE: {test_rmse:.4f}")
+        logging.info(f"Final Test Set R²: {test_r2:.4f}")
         
         # # Convert columns to supported types
         # test_predictions_df = test_predictions_df.with_columns([
@@ -309,11 +310,16 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         
         # Load the current data for final predictions
         from data import load_data
-        current_data = load_data()  # Load the current data
-        current_coins = current_data["coin"].to_numpy()  # Get the coin identifiers
+        current_data = load_data(for_training=False) 
+  
 
         # Define X_current by selecting relevant features from current_data
-        X_current = current_data.select(["timestamp", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
+        X_current = current_data.select(["timestamp", "coin", "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d", "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"])
+        X_current = X_current.drop_nulls()
+
+        # Get the coin identifiers
+        current_coins = X_current["coin"].to_numpy()
+        X_current = X_current.drop("coin")
 
         # Log the columns of X_current
         logging.info(f"Selected features: {selected_features}")
@@ -333,7 +339,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         # Exclude 'timestamp' from transformations
         features_for_transform = [col for col in selected_features if col != 'timestamp']
         X_current_features = X_current_selected.select(features_for_transform).to_numpy()
-
+        
         # Apply polynomial features using the same poly_transform object
         X_current_poly = poly_transform.transform(X_current_features)
 
@@ -347,7 +353,8 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         # Make predictions on the current data (drop 'timestamp' before prediction)
         X_current_final = X_current_processed[:, :-1]  # Exclude 'timestamp'
         y_current_pred = final_model.predict(X_current_final)
-
+        
+        print(y_current_pred.shape)
         # Create current predictions DataFrame
         current_predictions = {
             'timestamp': X_current_timestamp.flatten(),
