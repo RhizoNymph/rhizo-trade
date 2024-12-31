@@ -21,4 +21,6 @@ dependencies = [
     "scikit-learn>=1.6.0",
     "torch>=2.5.1",
     "cupy-cuda12x>=13.3.0",
+    "fredapi>=0.5.2",
+    "modal>=0.70.3",
 ]

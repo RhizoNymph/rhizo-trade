@@ -1,9 +1,12 @@
 import glob
+import os
 
 from schema import expected_schema, enforce_schema
 from preprocessing import *
 
 def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
+    print(os.getcwd())
+    print(os.listdir())
     files = glob.glob(f'{data_dir}/*.parquet')
     df = pl.concat([enforce_schema(pl.read_parquet(f)) for f in files])
     df = df.filter(~pl.col('coin').is_in(['BTC', 'USDT', 'USDC']))

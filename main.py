@@ -1,7 +1,7 @@
 import argparse
 from index.velo.client import handle_velo_spot, handle_velo_futures, handle_velo_options
 from index.geckoterminal.client import handle_geckoterminal
-
+from index.fred.client import handle_fred
 
 def add_common_velo_args(parser):
     """Add arguments that are common to all Velo commands"""
@@ -79,6 +79,9 @@ def main():
     velo_options_parser = velo_subparsers.add_parser('options', help='Index Velo options data')
     add_common_velo_args(velo_options_parser)
 
+    # FRED
+    fred_parser = index_subparsers.add_parser('fred', help='Index FRED data')
+
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze market data')
     # Add analyze-specific arguments here if needed
@@ -105,6 +108,8 @@ def main():
                     handle_velo_options(args)
                 else:
                     print("Please specify a Velo data type (spot/futures/options)")
+            elif args.index_type == 'fred':
+                handle_fred(args)
             else:
                 print("Please specify an index type (geckoterminal/velo)")
         elif args.mode == 'analyze':

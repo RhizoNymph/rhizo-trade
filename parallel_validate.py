@@ -12,8 +12,6 @@ import torch
 import xgboost as xgb
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.pipeline import Pipeline
-from sklearn.utils import shuffle
 
 from preprocessing import select_features_vif_polars
 from data import load_data
