@@ -46,7 +46,7 @@ def main():
         '--network',
         type=str,
         required=True,
-        choices=['eth', 'bsc', 'polygon', 'arbitrum', 'optimism', 'avalanche', 'fantom', 'celo', 'solana', 'base'],
+        choices=['eth', 'bsc', 'polygon', 'arbitrum', 'optimism', 'avalanche', 'fantom', 'celo', 'solana', 'base', 'osmosis'],
         help='Network to index'
     )
     gecko_parser.add_argument(

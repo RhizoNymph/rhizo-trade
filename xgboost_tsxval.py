@@ -96,7 +96,7 @@ def load_and_preprocess_data():
     return data.to_numpy(), scaler, poly_transform, selected_features
 
 def train_and_evaluate(args):
-    """Train and evaluate the model for a    given fold and hyperparameters."""
+    """Train and evaluate the model for a given fold and hyperparameters."""
     hyperparams, fold_idx, X_train_fold, y_train_fold, X_val_fold, y_val_fold, model_params, start_time_fold, scaler = args
     
     logging.info(f"Starting fold {fold_idx+1} evaluation with hyperparams: {hyperparams}")
@@ -125,14 +125,14 @@ def train_and_evaluate(args):
     
     # Predict on validation set
     y_val_pred = model.predict(X_val_scaled)
-    val_rmse = np.sqrt(mean_squared_error(y_val_fold, y_val_pred))
+    val_rmse = np.sqrt(mean_squared_error(y_val_fold, y_val_pred)) # This is RMSE
     
     # Store predictions
     predictions = [{
         'timestamp': X_val_fold[i, -1],
         'actual': y_val_fold[i],
         'predicted': y_val_pred[i],
-        'rmse': val_rmse
+        'error': abs(y_val_fold[i] - y_val_pred[i]) # Individual error (not RMSE)
     } for i in range(len(y_val_fold))]
     
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
@@ -205,7 +205,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         X_val_fold = X_train_val[start_val:end_val]
         y_val_fold = y_train_val[start_val:end_val]
 
-        num_samples = 480  
+        num_samples = 480
         if len(hyperparameter_combinations) < num_samples:
             sampled_combinations = hyperparameter_combinations
         else:
@@ -249,6 +249,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         final_model_params.update(best_model_params)
         final_model_params['early_stopping_rounds'] = 10
 
+        print(final_model_params)
         final_model = xgb.XGBRegressor(**final_model_params)
 
         # Scale the entire training data
