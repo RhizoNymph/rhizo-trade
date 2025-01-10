@@ -95,11 +95,11 @@ ranked_df = ranked_df.with_columns(
 )
 # Prepare data for vectorbt
 close_prices = ranked_df.pivot(
-    index="timestamp", columns="coin", values="close_price"
+    index="timestamp", on="coin", values="close_price"
 )
 
 entries = ranked_df.pivot(
-    index="timestamp", columns="coin", values="signal"
+    index="timestamp", on="coin", values="signal"
 ).select(
     [
         pl.when(pl.col(col) == 1)
@@ -111,7 +111,7 @@ entries = ranked_df.pivot(
 )
 
 exits = ranked_df.pivot(
-    index="timestamp", columns="coin", values="signal"
+    index="timestamp", on="coin", values="signal"
 ).select(
     [
         pl.when(pl.col(col) == -1)

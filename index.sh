@@ -1,2 +1,2 @@
 uv run main.py index velo spot --exchange binance --resolution 1d && uv run main.py index velo spot --exchange binance --resolution 1h && uv run main.py index velo spot --exchange coinbase --resolution 1d && uv run main.py index velo spot --exchange coinbase --resolution 1h &
-uv run main.py index geckoterminal --network solana --resolution 1d && uv run main.py index geckoterminal --network eth --resolution 1d && uv run main.py index geckoterminal --network base --resolution 1d
+uv run main.py index geckoterminal --network solana --resolution 1d && uv run main.py index geckoterminal --network eth --resolution 1d && uv run main.py index geckoterminal --network base --resolution 1d &

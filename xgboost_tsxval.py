@@ -16,6 +16,104 @@ from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from preprocessing import select_features_vif_polars
 from data import load_data
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_rmse, val_rmses, predictions_df):
+    """
+    Plots the residuals of the test set predictions, the distribution of predictions,
+    and a histogram of the validation RMSEs, all in one image with subplots.
+
+    Args:
+        y_test: True values of the test set (NumPy array).
+        y_test_pred: Predicted values of the test set (NumPy array).
+        test_rmse: RMSE of the test set.
+        val_rmses: List of RMSEs from cross-validation.
+        predictions_df: DataFrame containing test set predictions, including timestamps.
+    """
+
+    # Ensure y_test and y_test_pred are NumPy arrays
+    if isinstance(y_test_pred, torch.Tensor):
+        y_test_pred = y_test_pred.cpu().numpy()
+    if isinstance(y_test, torch.Tensor):
+        y_test = y_test.cpu().numpy()
+
+    # Flatten y_test_pred if it's not 1-dimensional
+    if y_test_pred.ndim > 1:
+        y_test_pred = y_test_pred.flatten()
+
+    # Flatten y_test if it's not 1-dimensional
+    if y_test.ndim > 1:
+        y_test = y_test.flatten()
+
+    residuals = y_test - y_test_pred
+
+    # Convert Polars DataFrame to Pandas DataFrame for compatibility with plotting functions
+    predictions_df = predictions_df.to_pandas()
+
+    # Sort predictions by timestamp for chronological plotting
+    predictions_df = predictions_df.sort_values(by="timestamp")
+
+    # --- Create Figure and Subplots ---
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))  # 2 rows, 3 columns
+
+    # --- Residual Plots ---
+
+    # 1. Overall Residual Plot
+    axes[0, 0].scatter(range(len(residuals)), residuals, alpha=0.7)
+    axes[0, 0].axhline(y=0, color='r', linestyle='--')
+    axes[0, 0].set_title(f'Overall Residuals (Test RMSE: {test_rmse:.4f})')
+    axes[0, 0].set_xlabel('Sample Index')
+    axes[0, 0].set_ylabel('Residual')
+
+    # 2. Residuals vs. Predicted Values
+    axes[0, 1].scatter(y_test_pred, residuals, alpha=0.7)
+    axes[0, 1].axhline(y=0, color='r', linestyle='--')
+    axes[0, 1].set_title('Residuals vs. Predicted Values')
+    axes[0, 1].set_xlabel('Predicted Value')
+    axes[0, 1].set_ylabel('Residual')
+
+    # 3. Residuals Over Time
+    # Ensure that predictions_df["timestamp"] and residuals have the same length
+    min_len = min(len(predictions_df["timestamp"]), len(residuals)) 
+    axes[0, 2].scatter(predictions_df["timestamp"][:min_len], residuals[:min_len], alpha=0.7)
+    axes[0, 2].axhline(y=0, color='r', linestyle='--')
+    axes[0, 2].set_title('Residuals Over Time')
+    axes[0, 2].set_xlabel('Timestamp')
+    axes[0, 2].set_ylabel('Residual')
+    axes[0, 2].tick_params(axis='x', rotation=45)
+
+    # --- Distribution of Predictions ---
+    sns.histplot(y_test_pred, ax=axes[1, 0], kde=True, color='skyblue', label='Predicted')
+    sns.histplot(y_test, ax=axes[1, 0], kde=True, color='orange', label='Actual')
+    axes[1, 0].set_title('Distribution of Predictions and Actual Values')
+    axes[1, 0].set_xlabel('Value')
+    axes[1, 0].set_ylabel('Frequency')
+    axes[1, 0].legend()
+
+    # --- RMSE Distribution ---
+    sns.histplot(val_rmses, ax=axes[1, 1], kde=True, color='green')
+    axes[1, 1].axvline(x=test_rmse, color='r', linestyle='--', label=f'Test RMSE: {test_rmse:.4f}')
+    axes[1, 1].set_title('Distribution of Validation RMSEs')
+    axes[1, 1].set_xlabel('RMSE')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].legend()
+
+    # --- (Optional) Actual vs Predicted Plot ---
+    min_val = min(np.min(y_test), np.min(y_test_pred))
+    max_val = max(np.max(y_test), np.max(y_test_pred))
+    axes[1, 2].plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--') # Diagonal line
+    axes[1, 2].scatter(y_test, y_test_pred, alpha=0.7)
+    axes[1, 2].set_title('Actual vs Predicted Values')
+    axes[1, 2].set_xlabel('Actual Value')
+    axes[1, 2].set_ylabel('Predicted Value')
+    axes[1, 2].set_xlim([min_val, max_val])
+    axes[1, 2].set_ylim([min_val, max_val])
+
+    plt.tight_layout()
+    plt.savefig("combined_diagnostics.png")
+    plt.close()
+
 pl.Config.set_tbl_rows(100)
 pl.Config(tbl_cols=10)
 
@@ -169,6 +267,8 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
     best_val_rmse = float('inf')
     best_model_params = None
     all_predictions = []
+
+    rmse_by_hyperparams = {}
     
     keys, values = zip(*hyperparameter_grid.items())
     hyperparameter_combinations = [dict(zip(keys, v)) for v in product(*values)]
@@ -228,11 +328,19 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
             val_rmses.append(val_rmse)
             all_predictions.extend(predictions)
 
-            if val_rmse < best_val_rmse:
-                best_val_rmse = val_rmse
-                best_model_params = hyperparams
-                logging.info(f"New best model found! RMSE: {best_val_rmse:.4f}")
-                logging.info(f"Best hyperparameters: {best_model_params}")
+            # if val_rmse < best_val_rmse:
+            #     best_val_rmse = val_rmse
+            #     best_model_params = hyperparams
+            #     logging.info(f"New best model found! RMSE: {best_val_rmse:.4f}")
+            #     logging.info(f"Best hyperparameters: {best_model_params}")
+
+                # Convert hyperparams to a tuple for dictionary key
+            hyperparams_tuple = tuple(sorted(hyperparams.items()))
+
+            if hyperparams_tuple not in rmse_by_hyperparams:
+                rmse_by_hyperparams[hyperparams_tuple] = []
+            rmse_by_hyperparams[hyperparams_tuple].append(val_rmse)
+
 
             print(f"Fold {fold_idx+1}, Hyperparams: {hyperparams}, Val RMSE: {val_rmse:.4f}, Time: {duration:.2f}s")
 
@@ -243,13 +351,22 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         print("\nLatest Validation Predictions:")
         print(predictions_df.tail(10))
 
+        avg_rmse_by_hyperparams = {}
+        for hyperparams_tuple, rmses in rmse_by_hyperparams.items():
+            avg_rmse_by_hyperparams[hyperparams_tuple] = np.mean(rmses)
+
+        best_hyperparams_tuple = min(avg_rmse_by_hyperparams, key=avg_rmse_by_hyperparams.get)
+        best_model_params = dict(best_hyperparams_tuple) # Convert back to dictionary
+        best_val_rmse = avg_rmse_by_hyperparams[best_hyperparams_tuple]
+        logging.info(f"Best average RMSE: {best_val_rmse:.4f}")
+        logging.info(f"Best hyperparameters: {best_model_params}")
+
         # Train final model on all data except test set
         logging.info("Training final model with best hyperparameters")
         final_model_params = model_params.copy()
         final_model_params.update(best_model_params)
         final_model_params['early_stopping_rounds'] = 10
 
-        print(final_model_params)
         final_model = xgb.XGBRegressor(**final_model_params)
 
         # Scale the entire training data
@@ -370,6 +487,11 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         print(current_predictions_df.head(20))
         
         logging.info("Validation complete!")
+
+        y_test_pred = y_test_pred.cpu().numpy()  # If y_test_pred is a tensor
+
+        plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_rmse, val_rmses, predictions_df)
+
         return final_model, test_rmse, best_model_params, predictions_df, current_predictions_df
         
 if __name__ == '__main__':
@@ -402,17 +524,17 @@ if __name__ == '__main__':
         'alpha': [0]
     }
 
-    # hyperparameter_grid = {
-    #     'n_estimators': [100, 200, 300, 400],  
-    #     'max_depth': [3, 5, 7, 9],  
-    #     'learning_rate': [0.01, 0.03, 0.05, 0.1],  
-    #     'gamma': [0, 0.1, 0.2],  
-    #     'subsample': [0.8, 0.9, 1.0],  
-    #     'colsample_bytree': [0.8, 0.9, 1.0],  
-    #     'min_child_weight': [1, 3, 5],  
-    #     'lambda': [0, 1, 2],  
-    #     'alpha': [0, 0.5, 1]  
-    # }
+    hyperparameter_grid = {
+        'n_estimators': [100, 200, 300, 400],  
+        'max_depth': [3, 5, 7, 9],  
+        'learning_rate': [0.01, 0.03, 0.05, 0.1],  
+        'gamma': [0, 0.1, 0.2],  
+        'subsample': [0.8, 0.9, 1.0],  
+        'colsample_bytree': [0.8, 0.9, 1.0],  
+        'min_child_weight': [1, 3, 5],  
+        'lambda': [0, 1, 2],  
+        'alpha': [0, 0.5, 1]  
+    }
 
     # Run the cross-validation
     final_model, test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(
@@ -427,4 +549,4 @@ if __name__ == '__main__':
         min_training_days=90,  
         test_size=0.1,  
         gap_days=7      
-    )
+    )   
