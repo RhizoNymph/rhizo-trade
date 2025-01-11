@@ -4,27 +4,28 @@ import polars as pl
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 import statsmodels.api as sm
 import numpy as np
+from datetime import datetime
 
-def load_and_preprocess_data():
-    """Load and preprocess the data."""
-    df = load_data()
+# def load_and_preprocess_data():
+#     """Load and preprocess the data."""
+#     df = load_data()
     
-    X = df.select([
-                    "timestamp", 
-                    "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
-                    "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
-                    #'vwma_3d', 'vwma_3d_dist', 'vwma_5d', 'vwma_5d_dist', 'vwma_7d', 'vwma_7d_dist', 'vwma_14d', 'vwma_14d_dist', 'vwma_30d', 'vwma_30d_dist',
-                    "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
-                ])
-    y = df.select("future_return_14d")
+#     X = df.select([
+#                     "timestamp", 
+#                     "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
+#                     "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
+#                     #'vwma_3d', 'vwma_3d_dist', 'vwma_5d', 'vwma_5d_dist', 'vwma_7d', 'vwma_7d_dist', 'vwma_14d', 'vwma_14d_dist', 'vwma_30d', 'vwma_30d_dist',
+#                     "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
+#                 ])
+#     y = df.select("future_return_7d")
 
-    # Preprocess the data
-    X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
+#     # Preprocess the data
+#     X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
 
-    # Combine features and target
-    data = pl.concat([pl.DataFrame(X_processed), y], how='horizontal')
+#     # Combine features and target
+#     data = pl.concat([pl.DataFrame(X_processed), y], how='horizontal')
     
-    return data.to_numpy(), scaler, poly_transform, selected_features
+#     return data.to_numpy(), scaler, poly_transform, selected_features
 
 def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None, for_training=True):
     # Feature selection
@@ -85,11 +86,12 @@ def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
     # Calculate returns and trading features
     df = df.group_by('coin').map_groups(lambda group: calculate_returns(group, frequency=data_dir[-1]))
     df = df.group_by('coin').map_groups(lambda group: calculate_trading_features(group))    
+    df = df.group_by('coin').map_groups(lambda group: calculate_time_features(group))
 
     # For training, calculate future_return_14d and drop nulls
     if for_training:
         df = df.with_columns(
-            (pl.col('close_price').shift(-14) / pl.col('close_price') - 1).alias('future_return_14d')
+            (pl.col('close_price').shift(-7) / pl.col('close_price') - 1).alias('future_return_7d')
         )
         df = df.drop_nulls()
 
@@ -135,6 +137,11 @@ def calculate_returns(group, future_periods=[1, 3, 5, 7, 14, 30], past_periods=[
 
         )   
 
+    # for period in past_periods[1:]:
+    #     group = group.tail(period).with_columns(
+    #         (pl.col(f'return_{period}{frequency}').mean().alias(f'avg_return_{period}{frequency}'))
+    #     )
+
     # Calculate standard deviation of past returns
     for period in past_periods[1:]:
         group = group.with_columns(
@@ -144,14 +151,33 @@ def calculate_returns(group, future_periods=[1, 3, 5, 7, 14, 30], past_periods=[
     return group
 
 def calculate_trading_features(group):
+    if 'buy_coin_volume' in group.columns:
+        group = group.with_columns(
+            (pl.col('buy_coin_volume') / pl.col('sell_coin_volume')).alias('coin_volume_bs_ratio'),
+            (pl.col('buy_trades') / pl.col('sell_trades')).alias('trades_bs_ratio'),
+            (pl.col('buy_coin_volume') + pl.col('sell_coin_volume')).alias('total_coin_volume'),
+            (pl.col('buy_trades') + pl.col('sell_trades')).alias('total_trades'),
+        )
+    
+    return group
+
+def calculate_time_features(group):
+    # Convert Unix timestamp (in milliseconds) to datetime
     group = group.with_columns(
-        (pl.col('buy_coin_volume') / pl.col('sell_coin_volume')).alias('coin_volume_bs_ratio'),
-        (pl.col('buy_trades') / pl.col('sell_trades')).alias('trades_bs_ratio'),
-        (pl.col('buy_coin_volume') + pl.col('sell_coin_volume')).alias('total_coin_volume'),
-        (pl.col('buy_trades') + pl.col('sell_trades')).alias('total_trades'),
+        pl.col('timestamp').map_elements(
+            lambda x: datetime.utcfromtimestamp(x / 1000), return_dtype=pl.Datetime
+        ).alias('datetime')
     )
 
+    # Extract time features
+    group = group.with_columns([
+        pl.col("datetime").dt.weekday().alias("day_of_week"),
+        pl.col("datetime").dt.day().alias("day_of_month"),
+        pl.col("datetime").dt.month().alias("month_of_year")
+    ])
+
     return group
+
 
 # Function to calculate VIF
 def calculate_vif(data: pl.DataFrame, threshold: float = 5.0) -> pl.Series:

@@ -175,15 +175,20 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None,
 def load_and_preprocess_data():
     """Load and preprocess the data."""
     df = load_data()
+
+    cols = ["timestamp", "day_of_week", "day_of_month", "month_of_year",
+            "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
+            #"avg_return_3d", "avg_return_5d", "avg_return_7d", "avg_return_14d", "avg_return_30d",
+            "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"]
     
-    X = df.select([
-                    "timestamp", 
-                    "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
-                    "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
-                    #'vwma_3d', 'vwma_3d_dist', 'vwma_5d', 'vwma_5d_dist', 'vwma_7d', 'vwma_7d_dist', 'vwma_14d', 'vwma_14d_dist', 'vwma_30d', 'vwma_30d_dist',
-                    "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
-                ])
-    y = df.select("future_return_14d")
+    if 'buy_coin_volume' in df.columns:
+        cols = cols + ["coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"]
+    else:
+        cols = cols + ["volume"]
+
+    X = df.select(cols)
+    
+    y = df.select("future_return_7d")
 
     # Preprocess the data
     X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
@@ -311,7 +316,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         X_val_fold = X_train_val[start_val:end_val]
         y_val_fold = y_train_val[start_val:end_val]
 
-        num_samples = 480 * 4
+        num_samples = 480
         if len(hyperparameter_combinations) < num_samples:
             sampled_combinations = hyperparameter_combinations
         else:
@@ -426,10 +431,10 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
 
         # Define X_current by selecting relevant features from current_data
         X_current = current_data.select([
-                                            "timestamp", "coin",
+                                            "timestamp", "coin", "day_of_week", "day_of_month", "month_of_year",
                                             "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
                                             "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
-                                            #'vwma_3d', 'vwma_3d_dist', 'vwma_5d', 'vwma_5d_dist', 'vwma_7d', 'vwma_7d_dist', 'vwma_14d', 'vwma_14d_dist', 'vwma_30d', 'vwma_30d_dist',
+                                            #"avg_return_3d", "avg_return_5d", "avg_return_7d", "avg_return_14d", "avg_return_30d",
                                             "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
                                         ])
         X_current = X_current.drop_nulls()
@@ -501,6 +506,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         return final_model, test_rmse, best_model_params, predictions_df, current_predictions_df
         
 if __name__ == '__main__':
+    np.random.seed(42)
     # Load and preprocess the data
     data_np, scaler, poly_transform, selected_features = load_and_preprocess_data()
 
@@ -530,17 +536,17 @@ if __name__ == '__main__':
         'alpha': [0]
     }
 
-    hyperparameter_grid = {
-        'n_estimators': [100, 200, 300, 400],  
-        'max_depth': [3, 5, 7, 9],  
-        'learning_rate': [0.01, 0.03, 0.05, 0.1],  
-        'gamma': [0, 0.1, 0.2],  
-        'subsample': [0.8, 0.9, 1.0],  
-        'colsample_bytree': [0.8, 0.9, 1.0],  
-        'min_child_weight': [1, 3, 5],  
-        'lambda': [0, 1, 2],  
-        'alpha': [0, 0.5, 1]  
-    }
+    # hyperparameter_grid = {
+    #     'n_estimators': [100, 200, 300, 400],  
+    #     'max_depth': [3, 5, 7, 9],  
+    #     'learning_rate': [0.01, 0.03, 0.05, 0.1],  
+    #     'gamma': [0, 0.1, 0.2],  
+    #     'subsample': [0.8, 0.9, 1.0],  
+    #     'colsample_bytree': [0.8, 0.9, 1.0],  
+    #     'min_child_weight': [1, 3, 5],  
+    #     'lambda': [0, 1, 2],  
+    #     'alpha': [0, 0.5, 1]  
+    # }
 
     # Run the cross-validation
     final_model, test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(
