@@ -190,9 +190,9 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None,
 
     return X_scaled_df, scaler, poly_transform, selected_features
 
-def load_and_preprocess_data():
+def load_and_preprocess_data(lags):
     """Load and preprocess the data."""
-    df = load_data()
+    df = load_data(lags=lags)
 
     cols = ["timestamp", "day_of_week", "day_of_month", "month_of_year",
             "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
@@ -205,8 +205,6 @@ def load_and_preprocess_data():
         "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
         "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"
     ]
-
-    lags=7
 
     lag_features = [f"{feature}_lag_{lag}" for feature in features for lag in range(1, lags + 1)]
 
@@ -278,7 +276,7 @@ def train_and_evaluate(args):
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
 def time_series_walk_forward_cv_xgboost_parallel(
-    features, target, model_params, hyperparameter_grid, selected_features, 
+    features, target, model_params, hyperparameter_grid, selected_features, lags,
     mode='dynamic', window_type='expanding', n_folds=5, validation_days=30, 
     min_training_days=90, test_size=0.1, gap_days=7
 ):
@@ -526,7 +524,7 @@ def time_series_walk_forward_cv_xgboost_parallel(
 
         # Load the current data for final predictions
         from data import load_data
-        current_data = load_data(for_training=False)
+        current_data = load_data(lags=lags, for_training=False)
 
         cols = ["timestamp", "day_of_week", "day_of_month", "month_of_year",
         "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
@@ -539,7 +537,6 @@ def time_series_walk_forward_cv_xgboost_parallel(
         "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
         "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"
         ]
-        lags=7
 
         lag_features = [f"{feature}_lag_{lag}" for feature in features for lag in range(1, lags + 1)]
 
@@ -626,8 +623,11 @@ def time_series_walk_forward_cv_xgboost_parallel(
         
 if __name__ == '__main__':
     np.random.seed(42)
+
+    lags=0
+
     # Load and preprocess the data
-    data_np, scaler, poly_transform, selected_features = load_and_preprocess_data()
+    data_np, scaler, poly_transform, selected_features = load_and_preprocess_data(lags=lags)
 
     # Split into features (X) and target (y)
     X_np = data_np[:, :-1]  
@@ -674,6 +674,7 @@ if __name__ == '__main__':
         model_params=model_params,
         hyperparameter_grid=hyperparameter_grid,
         selected_features=selected_features,  
+        lags=lags,
         mode='fixed',  
         window_type='expanding',
         n_folds=10,     
