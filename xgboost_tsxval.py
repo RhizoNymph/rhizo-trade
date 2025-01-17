@@ -19,6 +19,12 @@ from data import load_data
 import matplotlib.pyplot as plt
 import seaborn as sns  
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import scipy.stats as stats
+from statsmodels.graphics.tsaplots import plot_acf
+
 def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_rmse, val_rmses, predictions_df):
     """
     Plots the residuals of the test set predictions, the distribution of predictions,
@@ -38,13 +44,9 @@ def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_r
     if isinstance(y_test, torch.Tensor):
         y_test = y_test.cpu().numpy()
 
-    # Flatten y_test_pred if it's not 1-dimensional
-    if y_test_pred.ndim > 1:
-        y_test_pred = y_test_pred.flatten()
-
-    # Flatten y_test if it's not 1-dimensional
-    if y_test.ndim > 1:
-        y_test = y_test.flatten()
+    # Flatten y_test_pred and y_test if they are not 1-dimensional
+    y_test_pred = y_test_pred.flatten()
+    y_test = y_test.flatten()
 
     residuals = y_test - y_test_pred
 
@@ -55,7 +57,7 @@ def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_r
     predictions_df = predictions_df.sort_values(by="timestamp")
 
     # --- Create Figure and Subplots ---
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))  # 2 rows, 3 columns
+    fig, axes = plt.subplots(3, 3, figsize=(24, 18))  # 3 rows, 3 columns
 
     # --- Residual Plots ---
 
@@ -66,16 +68,15 @@ def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_r
     axes[0, 0].set_xlabel('Sample Index')
     axes[0, 0].set_ylabel('Residual')
 
-    # 2. Residuals vs. Predicted Values
-    axes[0, 1].scatter(y_test_pred, residuals, alpha=0.7)
+    # 2. Residuals vs. Actual Values
+    axes[0, 1].scatter(y_test, residuals, alpha=0.7)
     axes[0, 1].axhline(y=0, color='r', linestyle='--')
-    axes[0, 1].set_title('Residuals vs. Predicted Values')
-    axes[0, 1].set_xlabel('Predicted Value')
+    axes[0, 1].set_title('Residuals vs. Actual Values')
+    axes[0, 1].set_xlabel('Actual Value')
     axes[0, 1].set_ylabel('Residual')
 
     # 3. Residuals Over Time
-    # Ensure that predictions_df["timestamp"] and residuals have the same length
-    min_len = min(len(predictions_df["timestamp"]), len(residuals)) 
+    min_len = min(len(predictions_df["timestamp"]), len(residuals))
     axes[0, 2].scatter(predictions_df["timestamp"][:min_len], residuals[:min_len], alpha=0.7)
     axes[0, 2].axhline(y=0, color='r', linestyle='--')
     axes[0, 2].set_title('Residuals Over Time')
@@ -99,10 +100,10 @@ def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_r
     axes[1, 1].set_ylabel('Frequency')
     axes[1, 1].legend()
 
-    # --- (Optional) Actual vs Predicted Plot ---
+    # --- Actual vs Predicted Plot ---
     min_val = min(np.min(y_test), np.min(y_test_pred))
     max_val = max(np.max(y_test), np.max(y_test_pred))
-    axes[1, 2].plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--') # Diagonal line
+    axes[1, 2].plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--')  # Diagonal line
     axes[1, 2].scatter(y_test, y_test_pred, alpha=0.7)
     axes[1, 2].set_title('Actual vs Predicted Values')
     axes[1, 2].set_xlabel('Actual Value')
@@ -110,9 +111,26 @@ def plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_r
     axes[1, 2].set_xlim([min_val, max_val])
     axes[1, 2].set_ylim([min_val, max_val])
 
+    # --- Distribution of Residuals ---
+    sns.histplot(residuals, ax=axes[2, 0], kde=True, color='purple')
+    axes[2, 0].set_title('Distribution of Residuals')
+    axes[2, 0].set_xlabel('Residual')
+    axes[2, 0].set_ylabel('Frequency')
+
+    # --- QQ Plot for Residuals ---
+    stats.probplot(residuals, dist="norm", plot=axes[2, 1])
+    axes[2, 1].set_title('QQ Plot of Residuals')
+    axes[2, 1].set_xlabel('Theoretical Quantiles')
+    axes[2, 1].set_ylabel('Sample Quantiles')
+
+    # --- Autocorrelation of Residuals ---
+    plot_acf(residuals, lags=40, ax=axes[2, 2], title='Autocorrelation of Residuals')
+    axes[2, 2].set_xlabel('Lag')
+    axes[2, 2].set_ylabel('Autocorrelation')
+
     plt.tight_layout()
     plt.savefig("combined_diagnostics.png")
-    plt.close()
+    plt.close() 
 
 pl.Config.set_tbl_rows(100)
 pl.Config(tbl_cols=10)
@@ -178,9 +196,22 @@ def load_and_preprocess_data():
 
     cols = ["timestamp", "day_of_week", "day_of_month", "month_of_year",
             "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
-            #"avg_return_3d", "avg_return_5d", "avg_return_7d", "avg_return_14d", "avg_return_30d",
+            # "ewma_3d", "ewma_3d_dist", "ewma_5d", "ewma_5d_dist", "ewma_7d", "ewma_7d_dist", "ewma_14d", 
+            # "ewma_14d_dist", "ewma_30d", "ewma_30d_dist",
             "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"]
     
+    features = [
+        "day_of_week", "day_of_month", "month_of_year",
+        "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
+        "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"
+    ]
+
+    lags=7
+
+    lag_features = [f"{feature}_lag_{lag}" for feature in features for lag in range(1, lags + 1)]
+
+    cols = cols + lag_features
+
     if 'buy_coin_volume' in df.columns:
         cols = cols + ["coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"]
     else:
@@ -188,7 +219,7 @@ def load_and_preprocess_data():
 
     X = df.select(cols)
     
-    y = df.select("future_return_7d")
+    y = df.select("future_return_std_7d")
 
     # Preprocess the data
     X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
@@ -246,10 +277,20 @@ def train_and_evaluate(args):
     
     return val_rmse, hyperparams, fold_idx, time.time() - start_time_fold, predictions
 
-def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params, hyperparameter_grid, selected_features, mode='dynamic', n_folds=5, validation_days=30, min_training_days=90, test_size=0.1, gap_days=7):
+def time_series_walk_forward_cv_xgboost_parallel(
+    features, target, model_params, hyperparameter_grid, selected_features, 
+    mode='dynamic', window_type='expanding', n_folds=5, validation_days=30, 
+    min_training_days=90, test_size=0.1, gap_days=7
+):
     """Perform time series walk-forward cross-validation with XGBoost."""
     logging.info("Starting time series walk-forward cross-validation")
     logging.info(f"Data shape: Features {features.shape}, Target {target.shape}")
+    
+    # Keep data on CPU initially
+    if isinstance(features, torch.Tensor):
+        features = features.cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.cpu().numpy()
     
     # Split into train-val and final test
     total_days = len(features)
@@ -268,7 +309,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         logging.info(f"Using dynamic mode with {n_splits} validation windows of {validation_days} days each")
         logging.info(f"Minimum training size: {min_training_days} days")
         logging.info(f"Gap between train and validation sets: {gap_days} days")
-    elif mode == 'fixed':
+    elif mode == 'fixed':   
         n_splits = n_folds
         logging.info(f"Using fixed mode with {n_splits} folds")
     else:
@@ -295,8 +336,17 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
             # Calculate window boundaries for dynamic mode
             end_val = total_train_val_days - (n_splits - fold_idx - 1) * validation_days
             start_val = end_val - validation_days
-            start_train = 0  
-            end_train = start_val - gap_days
+            
+            if window_type == 'expanding':
+                # Expanding window: training set grows over time
+                start_train = 0  
+                end_train = start_val - gap_days
+            elif window_type == 'sliding':
+                # Sliding window: training set has a fixed size
+                start_train = start_val - min_training_days - gap_days
+                end_train = start_val - gap_days
+            else:
+                raise ValueError("Invalid window_type. Choose 'expanding' or 'sliding'.")
             
             if end_train - start_train < min_training_days:
                 continue  
@@ -339,19 +389,11 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
             val_rmses.append(val_rmse)
             all_predictions.extend(predictions)
 
-            # if val_rmse < best_val_rmse:
-            #     best_val_rmse = val_rmse
-            #     best_model_params = hyperparams
-            #     logging.info(f"New best model found! RMSE: {best_val_rmse:.4f}")
-            #     logging.info(f"Best hyperparameters: {best_model_params}")
-
-                # Convert hyperparams to a tuple for dictionary key
             hyperparams_tuple = tuple(sorted(hyperparams.items()))
 
             if hyperparams_tuple not in rmse_by_hyperparams:
                 rmse_by_hyperparams[hyperparams_tuple] = []
             rmse_by_hyperparams[hyperparams_tuple].append(val_rmse)
-
 
             print(f"Fold {fold_idx+1}, Hyperparams: {hyperparams}, Val RMSE: {val_rmse:.4f}, Time: {duration:.2f}s")
 
@@ -362,81 +404,154 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         print("\nLatest Validation Predictions:")
         print(predictions_df.tail(10))
 
+        # Calculate average RMSE for each hyperparameter combination
+        # Calculate average RMSE for each hyperparameter combination
         avg_rmse_by_hyperparams = {}
         for hyperparams_tuple, rmses in rmse_by_hyperparams.items():
             avg_rmse_by_hyperparams[hyperparams_tuple] = np.mean(rmses)
 
-        best_hyperparams_tuple = min(avg_rmse_by_hyperparams, key=avg_rmse_by_hyperparams.get)
-        best_model_params = dict(best_hyperparams_tuple) # Convert back to dictionary
-        best_val_rmse = avg_rmse_by_hyperparams[best_hyperparams_tuple]
-        logging.info(f"Best average RMSE: {best_val_rmse:.4f}")
-        logging.info(f"Best hyperparameters: {best_model_params}")
+        # Sort the models by average RMSE and select the top 5
+        sorted_hyperparams = sorted(avg_rmse_by_hyperparams.items(), key=lambda x: x[1])[:5]
+        top_5_hyperparams = [item[0] for item in sorted_hyperparams]
+        top_5_avg_rmses = [item[1] for item in sorted_hyperparams]
 
-        # Train final model on all data except test set
-        logging.info("Training final model with best hyperparameters")
-        final_model_params = model_params.copy()
-        final_model_params.update(best_model_params)
-        final_model_params['early_stopping_rounds'] = 10
-
-        final_model = xgb.XGBRegressor(**final_model_params)
+        logging.info(f"Top 5 average RMSEs: {top_5_avg_rmses}")
+        logging.info(f"Top 5 hyperparameters: {top_5_hyperparams}")
 
         # Scale the entire training data
         X_train_val_scaled = scaler.transform(X_train_val)
-        X_train_val_scaled = torch.tensor(X_train_val_scaled, dtype=torch.float32, device='cuda')
-
-        # Ensure y_train_val is of type float32
+        
+        # Convert to float32 to save memory
+        X_train_val_scaled = X_train_val_scaled.astype(np.float32)
         y_train_val = y_train_val.astype(np.float32)
-        y_train_val = torch.tensor(y_train_val, dtype=torch.float32, device='cuda')
 
         # Split the training data into training and validation sets
-        split_idx = int(0.8 * len(X_train_val_scaled)) 
+        split_idx = int(0.8 * len(X_train_val_scaled))
         X_train_final = X_train_val_scaled[:split_idx]
         y_train_final = y_train_val[:split_idx]
         X_val_final = X_train_val_scaled[split_idx:]
         y_val_final = y_train_val[split_idx:]
 
-        # Train the final model with early stopping
-        final_model.fit(
-            X_train_final.cpu().numpy(), y_train_final.cpu().numpy(),
-            eval_set=[(X_val_final.cpu().numpy(), y_val_final.cpu().numpy())],
-            verbose=False
-        )
-        
-        # Save the model
+        # Process in batches for the top 5 models
+        BATCH_SIZE = 10000  # Adjust based on your GPU memory
+        top_5_models = []
+
+        for hyperparams_tuple in top_5_hyperparams:
+            # Create a copy of the base model parameters
+            model_params_copy = model_params.copy()
+            model_params_copy.update(dict(hyperparams_tuple))
+            model_params_copy['early_stopping_rounds'] = 10
+            
+            # Train in batches if data is large
+            if len(X_train_final) > BATCH_SIZE:
+                model = xgb.XGBRegressor(**model_params_copy)
+                for i in range(0, len(X_train_final), BATCH_SIZE):
+                    end_idx = min(i + BATCH_SIZE, len(X_train_final))
+                    batch_X = X_train_final[i:end_idx]
+                    batch_y = y_train_final[i:end_idx]
+                    
+                    # Move batch to GPU, train, then free memory
+                    with torch.cuda.device('cuda'):
+                        batch_X_gpu = torch.tensor(batch_X, device='cuda')
+                        batch_y_gpu = torch.tensor(batch_y, device='cuda')
+                        
+                        model.fit(
+                            batch_X_gpu.cpu().numpy(), batch_y_gpu.cpu().numpy(),
+                            eval_set=[(X_val_final, y_val_final)],
+                            verbose=False,
+                            xgb_model=model if i > 0 else None  # Continue training from previous batch
+                        )
+                        
+                        # Explicitly free GPU memory
+                        del batch_X_gpu, batch_y_gpu
+                        torch.cuda.empty_cache()
+            else:
+                # For smaller datasets, train normally
+                model = xgb.XGBRegressor(**model_params_copy)
+                model.fit(
+                    X_train_final, y_train_final,
+                    eval_set=[(X_val_final, y_val_final)],
+                    verbose=False
+                )
+            
+            top_5_models.append(model)
+
+        # Save models and free memory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_dir = "models"
         if not os.path.exists(model_dir):
             os.makedirs(model_dir)
-            
-        model_path = os.path.join(model_dir, f"xgboost_model_{timestamp}.json")
-        final_model.save_model(model_path)
-        logging.info(f"Saved model to {model_path}")
-        
-        # Make predictions on test set
-        logging.info("Making predictions on test set")
+
+        for i, model in enumerate(top_5_models):
+            model_path = os.path.join(model_dir, f"xgboost_model_{timestamp}_top_{i+1}.json")
+            model.save_model(model_path)
+            logging.info(f"Saved top {i+1} model to {model_path}")
+
+        # Process test data in batches
         X_test_scaled = scaler.transform(X_test)
-        X_test_scaled = torch.tensor(X_test_scaled, dtype=torch.float32, device='cuda')
-        y_test_pred = final_model.predict(X_test_scaled.cpu().numpy())
-        y_test_pred = torch.tensor(y_test_pred, dtype=torch.float32, device='cuda')
-        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred.cpu().numpy()))
-        test_r2 = r2_score(y_test, y_test_pred.cpu().numpy())
-        
-        logging.info(f"Final Test Set RMSE: {test_rmse:.4f}")
-        logging.info(f"Final Test Set R²: {test_r2:.4f}")
-        
+        X_test_scaled = X_test_scaled.astype(np.float32)
+        test_predictions = []
+
+        for model in top_5_models:
+            if len(X_test_scaled) > BATCH_SIZE:
+                batch_predictions = []
+                for i in range(0, len(X_test_scaled), BATCH_SIZE):
+                    end_idx = min(i + BATCH_SIZE, len(X_test_scaled))
+                    batch_X = X_test_scaled[i:end_idx]
+                    
+                    # Move batch to GPU, predict, then free memory
+                    with torch.cuda.device('cuda'):
+                        batch_X_gpu = torch.tensor(batch_X, device='cuda')
+                        batch_pred = model.predict(batch_X_gpu.cpu().numpy())
+                        batch_predictions.append(batch_pred)
+                        
+                        del batch_X_gpu
+                        torch.cuda.empty_cache()
+                
+                y_test_pred = np.concatenate(batch_predictions)
+            else:
+                y_test_pred = model.predict(X_test_scaled)
+                
+            test_predictions.append(y_test_pred)
+
+        # Average the predictions
+        y_test_pred_avg = np.mean(test_predictions, axis=0)
+
+        # Calculate metrics
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred_avg))
+        test_r2 = r2_score(y_test, y_test_pred_avg)
+
+        logging.info(f"Final Test Set RMSE (Averaged): {test_rmse:.4f}")
+        logging.info(f"Final Test Set R² (Averaged): {test_r2:.4f}")
+
         # Load the current data for final predictions
         from data import load_data
-        current_data = load_data(for_training=False) 
-  
+        current_data = load_data(for_training=False)
+
+        cols = ["timestamp", "day_of_week", "day_of_month", "month_of_year",
+        "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
+        # "ewma_3d", "ewma_3d_dist", "ewma_5d", "ewma_5d_dist", "ewma_7d", "ewma_7d_dist", "ewma_14d", 
+        # "ewma_14d_dist", "ewma_30d", "ewma_30d_dist",
+        "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"]
+    
+        features = [
+        "day_of_week", "day_of_month", "month_of_year",
+        "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
+        "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d"
+        ]
+        lags=7
+
+        lag_features = [f"{feature}_lag_{lag}" for feature in features for lag in range(1, lags + 1)]
+
+        cols = cols + lag_features
+
+        if 'buy_coin_volume' in current_data.columns:
+            cols = cols + ["coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"]
+        else:
+            cols = cols + ["volume"]
 
         # Define X_current by selecting relevant features from current_data
-        X_current = current_data.select([
-                                            "timestamp", "coin", "day_of_week", "day_of_month", "month_of_year",
-                                            "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
-                                            "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
-                                            #"avg_return_3d", "avg_return_5d", "avg_return_7d", "avg_return_14d", "avg_return_30d",
-                                            "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
-                                        ])
+        X_current = current_data.select(cols + ["coin"])
         X_current = X_current.drop_nulls()
 
         # Get the coin identifiers
@@ -462,7 +577,7 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         # Exclude 'timestamp' from transformations
         features_for_transform = [col for col in selected_features if col != 'timestamp']
         X_current_features = X_current_selected.select(features_for_transform).to_numpy()
-        
+
         # Apply polynomial features using the same poly_transform object
         X_current_poly = poly_transform.transform(X_current_features)
 
@@ -473,20 +588,24 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         X_current_timestamp = X_current_selected.select("timestamp").to_numpy()
         X_current_processed = np.hstack([X_current_scaled, X_current_timestamp])
 
-        # Make predictions on the current data (drop 'timestamp' before prediction)
-        X_current_final = X_current_processed[:, :-1] 
-        y_current_pred = final_model.predict(X_current_final)
-        
-        print(y_current_pred.shape)
-        # Create current predictions DataFrame
-        current_predictions = {
+        # Make predictions on the current data using all top 5 models
+        current_predictions = []
+        for model in top_5_models:
+            y_current_pred = model.predict(X_current_processed[:, :-1])  # Drop 'timestamp' before prediction
+            current_predictions.append(y_current_pred)
+
+        # Average the predictions
+        y_current_pred_avg = np.mean(current_predictions, axis=0)
+
+        # Create the final predictions dictionary
+        current_predictions_avg = {
             'timestamp': X_current_timestamp.flatten(),
             'coin': current_coins,  
-            'predicted_future_return_14d': y_current_pred  
+            'predicted_future_return_14d': y_current_pred_avg  
         }
 
         # Convert to Polars DataFrame
-        current_predictions_df = pl.DataFrame(current_predictions)
+        current_predictions_df = pl.DataFrame(current_predictions_avg)
 
         # Get only most current predictions of most recent timestamp
         current_predictions_df = current_predictions_df.filter(pl.col("timestamp") == current_predictions_df["timestamp"].max())
@@ -499,11 +618,11 @@ def time_series_walk_forward_cv_xgboost_parallel(features, target, model_params,
         
         logging.info("Validation complete!")
 
-        y_test_pred = y_test_pred.cpu().numpy()  # If y_test_pred is a tensor
+        y_test_pred = y_test_pred  # If y_test_pred is a tensor
 
         plot_residuals_predictions_and_rmse_distribution(y_test, y_test_pred, test_rmse, val_rmses, predictions_df)
 
-        return final_model, test_rmse, best_model_params, predictions_df, current_predictions_df
+        return test_rmse, best_model_params, predictions_df, current_predictions_df
         
 if __name__ == '__main__':
     np.random.seed(42)
@@ -534,28 +653,29 @@ if __name__ == '__main__':
         'min_child_weight': [3],
         'lambda': [1],
         'alpha': [0]
-    }
+    }       
 
-    hyperparameter_grid = {
-        'n_estimators': [100, 200, 300, 400],  
-        'max_depth': [3, 5, 7, 9],  
-        'learning_rate': [0.01, 0.03, 0.05, 0.1],  
-        'gamma': [0, 0.1, 0.2],  
-        'subsample': [0.8, 0.9, 1.0],  
-        'colsample_bytree': [0.8, 0.9, 1.0],  
-        'min_child_weight': [1, 3, 5],  
-        'lambda': [0, 1, 2],  
-        'alpha': [0, 0.5, 1]
-    }
+    # hyperparameter_grid = {
+    #     'n_estimators': [100, 200, 300, 400],  
+    #     'max_depth': [3, 5, 7, 9],  
+    #     'learning_rate': [0.01, 0.03, 0.05, 0.1],  
+    #     'gamma': [0, 0.1, 0.2],  
+    #     'subsample': [0.8, 0.9, 1.0],  
+    #     'colsample_bytree': [0.8, 0.9, 1.0],  
+    #     'min_child_weight': [1, 3, 5],  
+    #     'lambda': [0, 1, 2],  
+    #     'alpha': [0, 0.5, 1]
+    # }
 
     # Run the cross-validation
-    final_model, test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(
+    test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(
         features=X_np,
         target=y_np,
         model_params=model_params,
         hyperparameter_grid=hyperparameter_grid,
         selected_features=selected_features,  
         mode='fixed',  
+        window_type='expanding',
         n_folds=10,     
         validation_days=30,  
         min_training_days=90,  

@@ -152,7 +152,7 @@ def get_all_futures_data(resolution="1h"):
             columns,
             [future["exchange"]],
             [future["product"]],
-            24,
+            args.lookback,
             resolution
         )
         if not df.is_empty():
@@ -171,7 +171,7 @@ def get_all_spot_data(resolution="1h"):
             columns,
             [spot["exchange"]],
             [spot["product"]],
-            24,
+            args.lookback,
             resolution
         )
         if not df.is_empty():
@@ -190,7 +190,7 @@ def get_all_options_data(resolution="1h"):
             columns,
             [option["exchange"]],
             [option["product"]],
-            24,
+            args.lookback,
             resolution
         )
         if not df.is_empty():

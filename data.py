@@ -6,27 +6,6 @@ import statsmodels.api as sm
 import numpy as np
 from datetime import datetime
 
-# def load_and_preprocess_data():
-#     """Load and preprocess the data."""
-#     df = load_data()
-    
-#     X = df.select([
-#                     "timestamp", 
-#                     "return_1d", "return_3d", "return_5d", "return_7d", "return_14d", "return_30d",
-#                     "return_std_3d", "return_std_5d", "return_std_7d", "return_std_14d", "return_std_30d",
-#                     #'vwma_3d', 'vwma_3d_dist', 'vwma_5d', 'vwma_5d_dist', 'vwma_7d', 'vwma_7d_dist', 'vwma_14d', 'vwma_14d_dist', 'vwma_30d', 'vwma_30d_dist',
-#                     "coin_volume_bs_ratio", "trades_bs_ratio", "total_coin_volume", "total_trades"
-#                 ])
-#     y = df.select("future_return_7d")
-
-#     # Preprocess the data
-#     X_processed, scaler, poly_transform, selected_features = preprocess_data(X)
-
-#     # Combine features and target
-#     data = pl.concat([pl.DataFrame(X_processed), y], how='horizontal')
-    
-#     return data.to_numpy(), scaler, poly_transform, selected_features
-
 def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None, for_training=True):
     # Feature selection
     if selected_features is None:
@@ -78,7 +57,9 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None,
 def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
     files = glob.glob(f'{data_dir}/*.parquet')
     df = pl.concat([enforce_schema(pl.read_parquet(f)) for f in files])
+
     df = df.filter(~pl.col('coin').is_in(['USDT', 'USDC']))
+
     
     # Sort by coin and timestamp
     df = df.sort(['coin', 'timestamp'])
@@ -87,6 +68,7 @@ def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
     df = df.group_by('coin').map_groups(lambda group: calculate_returns(group, frequency=data_dir[-1]))
     df = df.group_by('coin').map_groups(lambda group: calculate_trading_features(group))    
     df = df.group_by('coin').map_groups(lambda group: calculate_time_features(group))
+    #df = df.group_by('coin').map_groups(lambda group: calculate_ewma_features(group))
 
     # For training, calculate future_return_14d and drop nulls
     if for_training:
@@ -123,34 +105,93 @@ def enforce_schema(df):
         [pl.col(col_name).cast(col_type) for col_name, col_type in expected_schema.items()]
     )
 
-def calculate_returns(group, future_periods=[1, 3, 5, 7, 14, 30], past_periods=[1, 3, 5, 7, 14, 30], frequency='d'):
-    # Calculate future returns
-    for period in future_periods:
-        group = group.with_columns(
-            (pl.col('close_price').shift(-period) / pl.col('close_price') - 1).alias(f'future_return_{period}{frequency}')
-        )
-
+def calculate_returns(group, future_periods=[1, 3, 5, 7, 14, 30], past_periods=[1, 3, 5, 7, 14, 30], frequency='d', lags=7, winsorize=True):
+    existing_columns = set(group.columns)
+    
     # Calculate past returns
     for period in past_periods:
+        col_name = f'return_{period}{frequency}'
         group = group.with_columns(
-            (pl.col('close_price') / pl.col('close_price').shift(period) - 1).alias(f'return_{period}{frequency}')
-
-        )   
-
-    # for period in past_periods[1:]:
-    #     group = group.tail(period).with_columns(
-    #         (pl.col(f'return_{period}{frequency}').mean().alias(f'avg_return_{period}{frequency}'))
-    #     )
-
-    # Calculate standard deviation of past returns
-    for period in past_periods[1:]:
-        group = group.with_columns(
-            pl.col(f'return_{period}{frequency}').rolling_std(period).alias(f'return_std_{period}{frequency}')
+            (pl.col('close_price') / pl.col('close_price').shift(period) - 1).alias(col_name)
         )
 
+    if winsorize:
+        # Identify return columns to winsorize
+        return_cols = [col for col in group.columns if 'return' in col]
+        
+        # Winsorize within each group
+        for col in return_cols:
+            # Calculate percentiles within the group
+            group = group.with_columns(
+                pl.when(pl.col(col).is_not_null())
+                .then(pl.col(col).clip(pl.col(col).quantile(0.01), pl.col(col).quantile(0.99)))
+                .otherwise(pl.col(col))
+                .alias(col)
+            )
+    
+    # Calculate standard deviation of past returns
+    for period in past_periods[1:]:
+        std_col_name = f'return_std_{period}{frequency}'
+        group = group.with_columns(
+            pl.col(f'return_{period}{frequency}').rolling_std(period).alias(std_col_name)
+        )
+
+    # Calculate future returns
+    for period in future_periods:
+        col_name = f'future_return_{period}{frequency}'
+        group = group.with_columns(
+            (pl.col('close_price').shift(-period) / pl.col('close_price') - 1).alias(col_name)
+        )
+    
+    # Calculate future returns
+    for period in future_periods:
+        col_name = f'future_return_std_{period}{frequency}'
+        group = group.with_columns(
+            (pl.col('close_price').shift(-period) / pl.col('close_price') - 1).alias(col_name)
+        )
+
+    # Identify new columns
+    new_columns = set(group.columns) - existing_columns
+    
+    # Add lags for new columns
+    for col in new_columns:
+        for lag in range(1, lags + 1):
+            lag_col_name = f'{col}_lag_{lag}'
+            group = group.with_columns(pl.col(col).shift(lag).alias(lag_col_name))
+    
     return group
 
-def calculate_trading_features(group):
+def calculate_ewma_features(group, lags=7):
+    existing_columns = set(group.columns)
+    if 'close_price' in group.columns:
+        group = group.with_columns(
+            pl.col('close_price').ewm(span=3).mean().alias('ewma_3d'),
+            pl.col('close_price').ewm(span=5).mean().alias('ewma_5d'),
+            pl.col('close_price').ewm(span=7).mean().alias('ewma_7d'),
+            pl.col('close_price').ewm(span=14).mean().alias('ewma_14d'),
+            pl.col('close_price').ewm(span=30).mean().alias('ewma_30d'),
+        )
+
+    # Calculate distance from ewma
+    for period in [3, 5, 7, 14, 30]:
+        group = group.with_columns(
+            (pl.col('close_price') - pl.col(f'ewma_{period}d')).alias(f'ewma_{period}d_dist')
+        )
+    
+    # Identify new columns
+    new_columns = set(group.columns) - existing_columns
+    
+    # Add lags for new columns
+    for col in new_columns:
+        for lag in range(1, lags + 1):
+            lag_col_name = f'{col}_lag_{lag}'
+            group = group.with_columns(pl.col(col).shift(lag).alias(lag_col_name))
+    
+    return group
+
+def calculate_trading_features(group, lags=7):
+    existing_columns = set(group.columns)
+    
     if 'buy_coin_volume' in group.columns:
         group = group.with_columns(
             (pl.col('buy_coin_volume') / pl.col('sell_coin_volume')).alias('coin_volume_bs_ratio'),
@@ -159,25 +200,46 @@ def calculate_trading_features(group):
             (pl.col('buy_trades') + pl.col('sell_trades')).alias('total_trades'),
         )
     
+    # Identify new columns
+    new_columns = set(group.columns) - existing_columns
+    
+    # Add lags for new columns
+    for col in new_columns:
+        for lag in range(1, lags + 1):
+            lag_col_name = f'{col}_lag_{lag}'
+            group = group.with_columns(pl.col(col).shift(lag).alias(lag_col_name))
+    
     return group
 
-def calculate_time_features(group):
+def calculate_time_features(group, lags=7):
+    existing_columns = set(group.columns)
+    
     # Convert Unix timestamp (in milliseconds) to datetime
     group = group.with_columns(
         pl.col('timestamp').map_elements(
             lambda x: datetime.utcfromtimestamp(x / 1000), return_dtype=pl.Datetime
         ).alias('datetime')
     )
-
+    
     # Extract time features
     group = group.with_columns([
         pl.col("datetime").dt.weekday().alias("day_of_week"),
         pl.col("datetime").dt.day().alias("day_of_month"),
         pl.col("datetime").dt.month().alias("month_of_year")
     ])
-
+    
+    group = group.drop("datetime")
+    
+    # Identify new columns
+    new_columns = set(group.columns) - existing_columns
+    
+    # Add lags for new columns
+    for col in new_columns:
+        for lag in range(1, lags + 1):
+            lag_col_name = f'{col}_lag_{lag}'
+            group = group.with_columns(pl.col(col).shift(lag).alias(lag_col_name))
+    
     return group
-
 
 # Function to calculate VIF
 def calculate_vif(data: pl.DataFrame, threshold: float = 5.0) -> pl.Series:
