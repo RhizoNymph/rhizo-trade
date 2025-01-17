@@ -54,7 +54,7 @@ def preprocess_data(X, selected_features=None, poly_transform=None, scaler=None,
 
     return X_scaled_df, scaler, poly_transform, selected_features
 
-def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
+def load_data(lags, data_dir='data/velo/spot/binance/1d', for_training=True):
     files = glob.glob(f'{data_dir}/*.parquet')
     df = pl.concat([enforce_schema(pl.read_parquet(f)) for f in files])
 
@@ -65,10 +65,10 @@ def load_data(data_dir='data/velo/spot/binance/1d', for_training=True):
     df = df.sort(['coin', 'timestamp'])
 
     # Calculate returns and trading features
-    df = df.group_by('coin').map_groups(lambda group: calculate_returns(group, frequency=data_dir[-1]))
-    df = df.group_by('coin').map_groups(lambda group: calculate_trading_features(group))    
-    df = df.group_by('coin').map_groups(lambda group: calculate_time_features(group))
-    #df = df.group_by('coin').map_groups(lambda group: calculate_ewma_features(group))
+    df = df.group_by('coin').map_groups(lambda group: calculate_returns(group, frequency=data_dir[-1], lags=lags))
+    df = df.group_by('coin').map_groups(lambda group: calculate_trading_features(group, lags=lags))    
+    df = df.group_by('coin').map_groups(lambda group: calculate_time_features(group, lags=lags))
+    #df = df.group_by('coin').map_groups(lambda group: calculate_ewma_features(group, lags=lags))
 
     # For training, calculate future_return_14d and drop nulls
     if for_training:

@@ -624,7 +624,7 @@ def time_series_walk_forward_cv_xgboost_parallel(
 if __name__ == '__main__':
     np.random.seed(42)
 
-    lags=0
+    lags=14
 
     # Load and preprocess the data
     data_np, scaler, poly_transform, selected_features = load_and_preprocess_data(lags=lags)
@@ -655,17 +655,17 @@ if __name__ == '__main__':
         'alpha': [0]
     }       
 
-    # hyperparameter_grid = {
-    #     'n_estimators': [100, 200, 300, 400],  
-    #     'max_depth': [3, 5, 7, 9],  
-    #     'learning_rate': [0.01, 0.03, 0.05, 0.1],  
-    #     'gamma': [0, 0.1, 0.2],  
-    #     'subsample': [0.8, 0.9, 1.0],  
-    #     'colsample_bytree': [0.8, 0.9, 1.0],  
-    #     'min_child_weight': [1, 3, 5],  
-    #     'lambda': [0, 1, 2],  
-    #     'alpha': [0, 0.5, 1]
-    # }
+    hyperparameter_grid = {
+        'n_estimators': [100, 200, 300, 400],  
+        'max_depth': [3, 5, 7, 9],  
+        'learning_rate': [0.01, 0.03, 0.05, 0.1],  
+        'gamma': [0, 0.1, 0.2],  
+        'subsample': [0.8, 0.9, 1.0],  
+        'colsample_bytree': [0.8, 0.9, 1.0],  
+        'min_child_weight': [1, 3, 5],  
+        'lambda': [0, 1, 2],  
+        'alpha': [0, 0.5, 1]
+    }
 
     # Run the cross-validation
     test_rmse, best_model_params, predictions_df, current_predictions_df = time_series_walk_forward_cv_xgboost_parallel(

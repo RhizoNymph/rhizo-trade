@@ -25,4 +25,6 @@ dependencies = [
     "modal>=0.70.3",
     "yfinance>=0.2.51",
     "seaborn>=0.13.2",
+    "optuna>=4.1.0",
+    "arch>=7.2.0",
 ]
